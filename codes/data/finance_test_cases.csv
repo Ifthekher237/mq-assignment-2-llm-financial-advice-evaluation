@@ -1,0 +1,16 @@
+case_id,age,employment_status,monthly_income,monthly_expenses,current_savings,current_debt,risk_tolerance,financial_goal,investment_horizon,extra_preferences,task_type
+TC001,20,student,800,750,500,2000,low,Pay off student debt and build emergency fund,1 year,No investment products yet; wants simple actionable steps,debt_management
+TC002,24,part_time_worker,1500,1400,300,0,low,Build a 3-month emergency fund,6 months,Prefers halal/shariah-compliant savings accounts; avoids interest,savings_plan
+TC003,30,full_time_employed,3800,2600,8000,5000,moderate,Save for house deposit in 5 years,5 years,Partner also works; combined household planning preferred,goal_planning
+TC004,27,freelancer,2200,2100,1000,12000,low,Eliminate high-interest credit card debt urgently,2 years,Irregular income; wants conservative debt snowball approach,debt_management
+TC005,45,full_time_employed,7500,4000,50000,0,high,Aggressive wealth building via diversified investments,15 years,Interested in ETFs, index funds, some growth stocks,investment_advice
+TC006,35,full_time_employed,5000,3500,20000,8000,moderate,Balance debt repayment with retirement savings,10 years,Has employer-matched superannuation; wants to maximise match,retirement_planning
+TC007,55,self_employed,6000,4500,120000,0,low,Protect wealth and generate stable income before retirement,8 years,Prefers capital-protected products; risk-averse due to age,retirement_planning
+TC008,22,full_time_employed,2800,2400,2000,0,moderate,Start investing for the first time with small amounts,3 years,Complete beginner; wants education on ETFs vs managed funds,investment_advice
+TC009,40,full_time_employed,9000,5500,70000,15000,high,Maximise investment returns while managing mortgage,20 years,Holds property; wants diversification into equities and crypto,investment_advice
+TC010,33,unemployed,0,1800,15000,3000,low,Survive on savings and avoid going further into debt,6 months,Currently job hunting; needs strict expense reduction plan,budgeting
+TC011,29,full_time_employed,4200,2800,12000,0,moderate,Build wealth ethically without interest-based products,7 years,Strictly shariah-compliant; interested in halal ETFs and sukuk,investment_advice
+TC012,38,full_time_employed,6500,5000,30000,25000,moderate,Pay off mortgage faster while also investing,15 years,Has 2 dependants; wants to balance family security with growth,goal_planning
+TC013,50,part_time_worker,2500,2200,5000,8000,low,Clear debt and build a small retirement nest egg,10 years,Single parent with 1 child; limited disposable income,debt_management
+TC014,26,full_time_employed,3500,2000,9000,0,high,Build a high-growth portfolio with monthly contributions,10 years,Interested in individual stocks and crypto; accepts volatility,investment_advice
+TC015,42,full_time_employed,8000,5200,45000,0,moderate,Optimise tax and grow superannuation aggressively,12 years,Australian resident; wants to use concessional super contributions,retirement_planning

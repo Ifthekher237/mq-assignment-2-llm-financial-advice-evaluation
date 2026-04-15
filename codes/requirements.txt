@@ -1,0 +1,14 @@
+# requirements.txt — SmartFinance AI Assistant (Scaffold v1.0)
+# Install with: pip install -r requirements.txt
+
+# Core frontend
+streamlit>=1.32.0
+
+# ---------------------------------------------------------------------------
+# Future additions (uncomment when integrating a local LLM):
+# ---------------------------------------------------------------------------
+# transformers>=4.40.0      # Hugging Face model loading
+# torch>=2.2.0              # PyTorch inference backend
+# accelerate>=0.29.0        # Efficient model loading on CPU/GPU
+# sentencepiece>=0.2.0      # Tokenizer support for models like Mistral
+# ---------------------------------------------------------------------------
