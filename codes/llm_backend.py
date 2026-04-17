@@ -533,11 +533,10 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=420,
-                temperature=0.7,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.15,
+                max_new_tokens=260,
+                temperature=0.2,
+                do_sample=False,
+                repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
                 pad_token_id=tokenizer.eos_token_id,
             )
