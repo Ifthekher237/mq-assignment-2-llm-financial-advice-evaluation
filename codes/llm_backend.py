@@ -379,24 +379,27 @@ def _generate_mock_response(profile: dict, task_type: str, language: str) -> dic
 # ---------------------------------------------------------------------------
 
 def _build_tinyllama_messages(prompt: dict, language: str):
-    system_prompt = prompt.get(
-        "system",
-        "You are a responsible personal finance assistant. Provide educational guidance only."
+    system_prompt = (
+        "You are a responsible personal finance assistant. "
+        "Provide practical, personalised financial guidance based on the user's profile. "
+        "Do not repeat the prompt. "
+        "Do not say 'based on your financial profile' alone. "
+        "Give a complete answer with recommendation, action steps, explanation, and disclaimer."
     )
 
-    user_prompt = prompt.get("user", "")
-
     if language == "Bangla":
-        system_prompt += " Respond in Bangla if possible. Keep the advice simple and practical."
+        system_prompt += " Respond in Bangla if possible, using simple and practical language."
 
+    user_prompt = prompt.get("user", "")
     user_prompt += (
-        "\n\nPlease answer in this exact format:\n"
-        "RECOMMENDATION: ...\n\n"
+        "\n\nWrite a complete answer using this exact format:\n\n"
+        "RECOMMENDATION: Write 2-4 full sentences with specific advice based on the user's income, expenses, debt, savings, goal, and risk tolerance.\n\n"
         "ACTION STEPS:\n"
-        "1. ...\n"
-        "2. ...\n"
-        "3. ...\n\n"
-        "EXPLANATION: ...\n\n"
+        "1. Write a specific immediate step.\n"
+        "2. Write a specific short-term step.\n"
+        "3. Write a specific medium-term step.\n"
+        "4. Write a specific long-term step.\n\n"
+        "EXPLANATION: Write 2-4 sentences explaining why the recommendation suits this specific user.\n\n"
         "DISCLAIMER: This is educational information only and not personalised financial advice."
     )
 
@@ -406,6 +409,8 @@ def _build_tinyllama_messages(prompt: dict, language: str):
     ]
 
 
+import re
+
 def _parse_tinyllama_output(text: str) -> dict:
     text = text.strip()
 
@@ -414,48 +419,71 @@ def _parse_tinyllama_output(text: str) -> dict:
     explanation = ""
     disclaimer = ""
 
-    upper_text = text.upper()
+    rec_match = re.search(
+        r"RECOMMENDATION:\s*(.*?)(?:\n\s*ACTION STEPS:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    act_match = re.search(
+        r"ACTION STEPS:\s*(.*?)(?:\n\s*EXPLANATION:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    exp_match = re.search(
+        r"EXPLANATION:\s*(.*?)(?:\n\s*DISCLAIMER:|\Z)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    dis_match = re.search(
+        r"DISCLAIMER:\s*(.*)$",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-    rec_idx = upper_text.find("RECOMMENDATION:")
-    act_idx = upper_text.find("ACTION STEPS:")
-    exp_idx = upper_text.find("EXPLANATION:")
-    dis_idx = upper_text.find("DISCLAIMER:")
+    if rec_match:
+        recommendation = rec_match.group(1).strip()
 
-    if rec_idx != -1:
-        end = act_idx if act_idx != -1 else len(text)
-        recommendation = text[rec_idx + len("RECOMMENDATION:"):end].strip()
-
-    if act_idx != -1:
-        end = exp_idx if exp_idx != -1 else len(text)
-        action_block = text[act_idx + len("ACTION STEPS:"):end].strip()
+    if act_match:
+        action_block = act_match.group(1).strip()
         for line in action_block.splitlines():
             stripped = line.strip()
             if not stripped:
                 continue
-            if stripped[:2].isdigit() or stripped.startswith(("-", "•", "*")):
-                action_steps.append(stripped.lstrip("0123456789.-•* ").strip())
-            else:
-                action_steps.append(stripped)
+            cleaned = re.sub(r"^[\-\•\*\d\.\)\s]+", "", stripped).strip()
+            if cleaned:
+                action_steps.append(cleaned)
 
-    if exp_idx != -1:
-        end = dis_idx if dis_idx != -1 else len(text)
-        explanation = text[exp_idx + len("EXPLANATION:"):end].strip()
+    if exp_match:
+        explanation = exp_match.group(1).strip()
 
-    if dis_idx != -1:
-        disclaimer = text[dis_idx + len("DISCLAIMER:"):].strip()
+    if dis_match:
+        disclaimer = dis_match.group(1).strip()
 
-    if not recommendation:
-        recommendation = text
+    # Smarter fallbacks
+    if not recommendation or len(recommendation.split()) < 12:
+        recommendation = text[:600].strip()
+
+    if not action_steps:
+        # Try to extract numbered lines anywhere in output
+        for line in text.splitlines():
+            stripped = line.strip()
+            if re.match(r"^\d+[\.\)]\s+", stripped):
+                cleaned = re.sub(r"^\d+[\.\)]\s+", "", stripped).strip()
+                if cleaned:
+                    action_steps.append(cleaned)
 
     if not action_steps:
         action_steps = [
-            "Review the recommendation carefully and adapt it to your personal circumstances.",
-            "Consider discussing major financial decisions with a qualified financial adviser.",
+            "Track your income and expenses carefully over the next month.",
+            "Review high-cost spending areas and reduce unnecessary expenses.",
+            "Direct any monthly surplus toward your main financial goal.",
+            "Consult a qualified financial adviser before major decisions.",
         ]
 
-    if not explanation:
+    if not explanation or len(explanation.split()) < 10:
         explanation = (
-            "This response was generated by the selected TinyLlama model based on your financial profile and task type."
+            "This advice was generated using TinyLlama based on the user's income, expenses, "
+            "debt, savings, financial goal, investment horizon, and risk tolerance."
         )
 
     if not disclaimer:
@@ -465,11 +493,10 @@ def _parse_tinyllama_output(text: str) -> dict:
 
     return {
         "recommendation": recommendation,
-        "action_steps": action_steps,
+        "action_steps": action_steps[:6],
         "explanation": explanation,
         "disclaimer": disclaimer,
     }
-
 
 # ---------------------------------------------------------------------------
 # Selected Model — Real TinyLlama inference with fallback
@@ -506,11 +533,12 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=280,
+                max_new_tokens=420,
                 temperature=0.7,
                 do_sample=True,
                 top_p=0.9,
-                repetition_penalty=1.1,
+                repetition_penalty=1.15,
+                no_repeat_ngram_size=3,
                 pad_token_id=tokenizer.eos_token_id,
             )
 
