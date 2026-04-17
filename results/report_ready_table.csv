@@ -1,0 +1,7 @@
+model,strategy,relevance,clarity,personalization,actionability,safety,financial_reasoning,overall_score,latency_sec,output_word_count
+flan_t5_large,few_shot,0.33,0.53,0.67,0.6,0.93,0.07,0.52,4.48,64.93
+flan_t5_large,structured,1.4,1.07,1.0,1.47,0.87,1.13,1.15,8.83,134.07
+flan_t5_large,zero_shot,1.07,0.87,0.8,1.4,0.93,1.33,1.07,7.34,113.6
+tinyllama_1b_chat,few_shot,2.6,2.93,1.6,2.93,2.73,2.53,2.55,11.23,187.93
+tinyllama_1b_chat,structured,2.4,2.47,1.93,1.27,2.87,2.73,2.28,10.98,161.93
+tinyllama_1b_chat,zero_shot,2.6,2.53,1.13,2.53,1.4,2.8,2.17,11.29,234.47

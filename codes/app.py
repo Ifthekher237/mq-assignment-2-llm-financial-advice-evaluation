@@ -1,7 +1,7 @@
 """
 app.py — Streamlit frontend for SmartFinance AI Assistant
 COMP8420 Assignment 2: Large Language Models
-Scaffold v1.0 — Initial functional version
+Final submission version
 """
 
 import streamlit as st
@@ -27,12 +27,14 @@ with st.sidebar:
     st.title("⚙️ Settings")
     st.markdown("---")
 
+    st.success("Selected backend model: TinyLlama-1.1B-Chat")
+
     model_mode = st.selectbox(
         "🤖 Model Mode",
-        options=["Mock Mode", "Local Model Placeholder"],
+        options=["Mock Mode", "TinyLlama (Selected Model)"],
         help=(
             "Mock Mode returns a structured demo response based on your profile. "
-            "Local Model Placeholder is reserved for future LLM integration."
+            "TinyLlama mode reflects the selected model from comparative evaluation."
         ),
     )
 
@@ -58,11 +60,13 @@ with st.sidebar:
     st.markdown(
         "**COMP8420 — Assignment 2**  \n"
         "Smart Personal Finance Assistant  \n"
-        "*Scaffold v1.0*"
+        "*Final submission version*"
     )
     st.markdown(
         "This tool collects your financial profile and generates "
-        "personalised recommendations using an LLM backend."
+        "personalised recommendations using an LLM backend. "
+        "TinyLlama-1.1B-Chat was selected as the preferred model "
+        "after comparative evaluation."
     )
 
 # ---------------------------------------------------------------------------
@@ -193,13 +197,12 @@ if submitted:
     st.success("✅ Your personalised financial advice is ready!")
     st.markdown("---")
 
-    # --- Profile Snapshot ---
     st.subheader("👤 Your Financial Snapshot")
-    surplus      = compute_surplus(monthly_income, monthly_expenses)
+    surplus = compute_surplus(monthly_income, monthly_expenses)
     savings_rate = compute_savings_rate(monthly_income, monthly_expenses)
 
     col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("Monthly Income",   format_currency(monthly_income))
+    col_a.metric("Monthly Income", format_currency(monthly_income))
     col_b.metric("Monthly Expenses", format_currency(monthly_expenses))
     col_c.metric(
         "Monthly Surplus",
@@ -207,22 +210,20 @@ if submitted:
         delta=f"{savings_rate:.1f}% savings rate",
         delta_color="normal" if surplus >= 0 else "inverse",
     )
-    col_d.metric("Current Savings",  format_currency(current_savings))
+    col_d.metric("Current Savings", format_currency(current_savings))
 
     col_e, col_f, col_g, col_h = st.columns(4)
-    col_e.metric("Current Debt",       format_currency(current_debt))
-    col_f.metric("Risk Tolerance",     risk_tolerance)
-    col_g.metric("Horizon",            investment_horizon.split("(")[0].strip())
-    col_h.metric("Task",               task_type)
+    col_e.metric("Current Debt", format_currency(current_debt))
+    col_f.metric("Risk Tolerance", risk_tolerance)
+    col_g.metric("Horizon", investment_horizon.split("(")[0].strip())
+    col_h.metric("Task", task_type)
 
     st.markdown("---")
 
-    # --- Recommendation ---
     st.subheader(f"💡 {task_type} Recommendation")
     st.markdown(result.get("recommendation", "_No recommendation available._"))
     st.markdown("---")
 
-    # --- Action Steps ---
     st.subheader("✅ Action Steps")
     action_steps = result.get("action_steps", [])
     if isinstance(action_steps, list) and action_steps:
@@ -233,20 +234,17 @@ if submitted:
 
     st.markdown("---")
 
-    # --- Explanation ---
     st.subheader("🔍 Why This Advice Fits You")
     st.info(result.get("explanation", "_No explanation available._"))
 
-    # --- Prompt Inspector (assignment evidence) ---
-    with st.expander("🔧 View Generated Prompt  (LLM comparison / assignment evidence)"):
+    with st.expander("🔧 View Generated Prompt (LLM comparison / assignment evidence)"):
         from prompt_templates import build_structured_prompt
         preview = build_structured_prompt(raw_profile, task_type, language)
         st.markdown("**System Prompt:**")
         st.code(preview.get("system", ""), language="text")
         st.markdown("**User Prompt:**")
-        st.code(preview.get("user", ""),   language="text")
+        st.code(preview.get("user", ""), language="text")
 
-    # --- Disclaimer ---
     st.markdown("---")
     st.warning(result.get(
         "disclaimer",
