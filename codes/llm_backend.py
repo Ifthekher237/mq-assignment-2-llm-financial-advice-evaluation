@@ -761,10 +761,10 @@ def _is_low_quality_tinyllama_output(raw_text: str, parsed: dict) -> bool:
         if re.search(pattern, text_lower):
             return True
 
-    if len(text_lower.split()) < 40:
+    if len(text_lower.split()) < 25:
         return True
 
-    if len(recommendation.split()) < 8:
+    if len(recommendation.split()) < 5:
         return True
 
     useful_steps = [
@@ -774,10 +774,10 @@ def _is_low_quality_tinyllama_output(raw_text: str, parsed: dict) -> bool:
     if len(useful_steps) < 2:
         return True
 
-    if len(explanation.split()) < 6:
+    if len(explanation.split()) < 4:
         return True
 
-    if len(disclaimer.split()) < 6:
+    if len(disclaimer.split()) < 4:
         return True
 
     heading_only_patterns = [
@@ -866,20 +866,30 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
             + parsed["recommendation"]
         )
 
+
+
         if language == "Bangla":
-            # If the model output is not genuinely Bangla, translate the full structured result.
-            rec_text = _safe_text(parsed.get("recommendation", ""))
-            if not re.search(r"[\u0980-\u09FF]", rec_text):
+            full_text = (
+                parsed.get("recommendation", "") +
+                " ".join(parsed.get("action_steps", [])) +
+                parsed.get("explanation", "")
+            )
+
+            # If output is mostly English → translate EVERYTHING
+            if not re.search(r"[\u0980-\u09FF]{10,}", full_text):
                 label = "**Generated using selected backend model: TinyLlama-1.1B-Chat**"
+
                 bare_result = {
-                    "recommendation": rec_text.replace(label, "").strip(),
+                    "recommendation": parsed.get("recommendation", "").replace(label, "").strip(),
                     "action_steps": parsed.get("action_steps", []),
                     "explanation": parsed.get("explanation", ""),
                     "disclaimer": parsed.get("disclaimer", ""),
                 }
 
                 translated = _translate_result_to_bangla(bare_result)
+
                 translated["recommendation"] = label + "\n\n" + translated.get("recommendation", "")
+
                 parsed = translated
 
 
