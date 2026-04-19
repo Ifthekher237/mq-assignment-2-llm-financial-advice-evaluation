@@ -818,18 +818,31 @@ def _generate_tinyllama(profile: dict, prompt: dict, language: str) -> dict:
             + final["recommendation"]
         )
 
-        # ── Translate if Bangla ──
+
+        # ── Translate final structured result to Bangla if requested ──
         if language == "Bangla":
-            # Strip the credit line before translation, then re-add in Bangla
-            rec_body = final["recommendation"].replace(
-                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n", ""
-            )
-            final["recommendation"] = rec_body
-            final = _translate_result_to_bangla(final)
-            final["recommendation"] = (
-                "**নির্বাচিত মডেল ব্যবহার করে তৈরি: TinyLlama-1.1B-Chat**\n\n"
-                + final["recommendation"]
-            )
+            credit_en = "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
+            recommendation_body = _s(final.get("recommendation", "")).replace(credit_en, "").strip()
+
+            english_structured = {
+                "recommendation": recommendation_body,
+                "action_steps": final.get("action_steps", []),
+                "explanation": final.get("explanation", ""),
+                "disclaimer": final.get("disclaimer", ""),
+            }
+
+            translated = _translate_result_to_bangla(english_structured)
+
+            final = {
+                "recommendation": (
+                    "**নির্বাচিত মডেল ব্যবহার করে তৈরি: TinyLlama-1.1B-Chat**\n\n"
+                    + translated.get("recommendation", "")
+                ),
+                "action_steps": translated.get("action_steps", []),
+                "explanation": translated.get("explanation", ""),
+                "disclaimer": translated.get("disclaimer", ""),
+            }
+
 
         return final
 
