@@ -498,7 +498,7 @@ def _generate_mock_response(profile: dict, task_type: str, language: str) -> dic
     )
 
     if language == "Bangla":
-        result = _build_bangla_mock_wrapper(result)
+        result = _translate_result_to_bangla(result)
 
     return result
 
@@ -787,7 +787,7 @@ def _is_low_quality_tinyllama_output(raw_text: str, parsed: dict) -> bool:
         "disclaimer:",
     ]
     for heading in heading_only_patterns:
-        if text_lower.count(heading) >= 2 and len(text_lower.replace(heading, "").strip().split()) < 40:
+        if text_lower.count(heading) >= 2 and len(text_lower.replace(heading, "").strip().split()) < 25:
             return True
 
     return False
@@ -867,18 +867,17 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
         )
 
 
-
         if language == "Bangla":
             full_text = (
-                parsed.get("recommendation", "") +
-                " ".join(parsed.get("action_steps", [])) +
-                parsed.get("explanation", "")
+                parsed.get("recommendation", "")
+                + " "
+                + " ".join(parsed.get("action_steps", []))
+                + " "
+                + parsed.get("explanation", "")
             )
 
-            # If output is mostly English → translate EVERYTHING
             if not re.search(r"[\u0980-\u09FF]{10,}", full_text):
                 label = "**Generated using selected backend model: TinyLlama-1.1B-Chat**"
-
                 bare_result = {
                     "recommendation": parsed.get("recommendation", "").replace(label, "").strip(),
                     "action_steps": parsed.get("action_steps", []),
@@ -887,25 +886,28 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
                 }
 
                 translated = _translate_result_to_bangla(bare_result)
-
                 translated["recommendation"] = label + "\n\n" + translated.get("recommendation", "")
-
                 parsed = translated
 
 
         return parsed
 
     except Exception as e:
+
         fallback = _generate_mock_response(profile, task_type, language)
-        fallback["recommendation"] = (
-            "**TinyLlama inference was unavailable on this device, so the app used a stable fallback response.**\n\n"
-            + fallback["recommendation"]
-        )
-        fallback["explanation"] = (
-            fallback.get("explanation", "")
-            + " TinyLlama was selected as the preferred backend model based on comparative evaluation, "
-            + f"but live inference could not be completed on this run. Technical reason: {str(e)}"
-        )
+
+        if language == "Bangla":
+            fallback_prefix = (
+                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
+                "এই রানে লাইভ মডেলের আউটপুট অসম্পূর্ণ বা নিম্নমানের ছিল, তাই নিচে একটি স্থিতিশীল বিকল্প উত্তর দেখানো হলো।\n\n"
+            )
+        else:
+            fallback_prefix = (
+                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
+                "The live model output on this run was incomplete or low quality, so a stable fallback response is shown below.\n\n"
+            )
+
+        fallback["recommendation"] = fallback_prefix + fallback["recommendation"]
         return fallback
 
 
