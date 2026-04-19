@@ -1,11 +1,16 @@
 """
-llm_backend.py — LLM response generation for SmartFinance AI Assistant
+llm_backend.py — LLM response engine for the Smart Personal Finance Assistant
+COMP8420 Assignment 2 — Large Language Models
 
-Supports two modes:
-- Mock Mode: structured, personalised demo response based on user profile data.
-- TinyLlama (Selected Model): real TinyLlama inference path with safe fallback.
+Modes:
+- Mock Mode: rule-based structured responses, stable for all demos.
+- TinyLlama (Selected Model): real local inference (English generation always),
+  then translated to Bangla via googletrans if the user selected Bangla.
 
-Main entry point: generate_financial_response(profile, prompt, mode, language)
+Public API:
+    generate_financial_response(profile, prompt, mode="Mock Mode", language="English")
+    Returns: dict with keys recommendation, action_steps, explanation, disclaimer
+             or dict with key error on failure.
 """
 
 import re
@@ -18,484 +23,365 @@ from utils import (
     compute_debt_to_income_ratio,
 )
 
-
-
-try:
-    from googletrans import Translator
-    GOOGLETRANS_AVAILABLE = True
-except Exception:
-    Translator = None
-    GOOGLETRANS_AVAILABLE = False
-
 # ---------------------------------------------------------------------------
-# Optional TinyLlama dependencies
+# Optional heavy dependencies — fail gracefully if absent
 # ---------------------------------------------------------------------------
 
 try:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    TRANSFORMERS_AVAILABLE = True
+    _TRANSFORMERS_OK = True
 except Exception:
     torch = None
     AutoTokenizer = None
     AutoModelForCausalLM = None
-    TRANSFORMERS_AVAILABLE = False
+    _TRANSFORMERS_OK = False
+
+try:
+    from googletrans import Translator as _GTranslator
+    _GOOGLETRANS_OK = True
+except Exception:
+    _GTranslator = None
+    _GOOGLETRANS_OK = False
 
 # ---------------------------------------------------------------------------
-# Selected model from comparative evaluation
+# Constants
 # ---------------------------------------------------------------------------
 
-SELECTED_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+_SELECTED_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+_FALLBACK_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}<|system|>\n{{ message['content'] }}\n{% endif %}"
+    "{% if message['role'] == 'user' %}<|user|>\n{{ message['content'] }}\n{% endif %}"
+    "{% if message['role'] == 'assistant' %}<|assistant|>\n{{ message['content'] }}\n{% endif %}"
+    "{% endfor %}<|assistant|>\n"
+)
 
-_TOKENIZER = None
-_MODEL = None
-_MODEL_LOAD_ERROR = None
+# Module-level lazy-load slots
+_tok = None
+_mdl = None
+_load_err = None
 
 
 # ---------------------------------------------------------------------------
-# Small internal helpers
+# ── Small helper utilities ──
 # ---------------------------------------------------------------------------
 
-def _safe_text(value, default: str = "") -> str:
-    """Return a clean string without raising exceptions."""
+def _s(value, default: str = "") -> str:
+    """Return a stripped string; never raises."""
     try:
-        text = str(value).strip()
-        return text if text else default
+        t = str(value).strip()
+        return t if t else default
     except Exception:
         return default
 
 
-def _format_amount(value) -> str:
-    """Format numeric values for prompt injection."""
+def _amt(value) -> str:
+    """Format a number as $X,XXX for prompt injection."""
     try:
         return f"${float(value):,.0f}"
     except Exception:
         return "$0"
 
 
-def _clean_generated_text(text: str) -> str:
-    """Remove common junk that small models often echo back."""
+def _clean(text: str) -> str:
+    """Strip special tokens and common instruction echoes from model output."""
     if not text:
         return ""
+    t = text
+    for tok in ("<|assistant|>", "<|user|>", "<|system|>", "<s>", "</s>"):
+        t = t.replace(tok, " ")
+    t = re.sub(r"\[[^\]]{1,80}\]", "", t)           # [placeholder]
+    t = re.sub(r"\{[^\}]{1,80}\}", "", t)            # {placeholder}
+    t = re.sub(r"(?i)^instructions?:\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"(?i)use (only|this|the) (profile|exact|actual).*", "", t)
+    t = re.sub(r"(?i)do not (use|copy|repeat|invent|include).*", "", t)
+    t = re.sub(r"(?i)write (the|a|your|all).*section.*", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
-    cleaned = text.replace("<|assistant|>", " ").replace("<|user|>", " ").replace("<|system|>", " ")
-    cleaned = re.sub(r"\[[^\]]{1,80}\]", "", cleaned)
-    cleaned = re.sub(r"\{[^\}]{1,80}\}", "", cleaned)
-    cleaned = re.sub(r"(?i)^instructions:\s*", "", cleaned, flags=re.MULTILINE)
-    cleaned = re.sub(r"(?i)use this exact output structure:.*", "", cleaned)
-    cleaned = re.sub(r"(?i)do not use placeholders.*", "", cleaned)
-    cleaned = re.sub(r"(?i)do not repeat the profile.*", "", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
 
-
-def _strip_label(line: str) -> str:
+def _strip_bullet(line: str) -> str:
     return re.sub(r"^[\-\•\*\d\.\)\s]+", "", line).strip()
 
 
-def _ensure_disclaimer_text(language: str) -> str:
-    if language == "Bangla":
-        return (
-            "এই তথ্য কেবল শিক্ষামূলক উদ্দেশ্যে দেওয়া হয়েছে। ব্যক্তিগত আর্থিক সিদ্ধান্ত নেওয়ার আগে "
-            "একজন নিবন্ধিত আর্থিক উপদেষ্টার সঙ্গে পরামর্শ করুন।"
-        )
+def _disclaimer_en() -> str:
     return (
-        "This information is for educational purposes only and is not personalised financial advice. "
-        "Please consult a registered financial adviser before making financial decisions."
+        "This information is for educational purposes only and does not constitute "
+        "personalised financial advice. Please consult a registered financial adviser "
+        "before making any financial decisions."
     )
 
+
+def _disclaimer_bn() -> str:
+    return (
+        "এই তথ্য কেবল শিক্ষামূলক উদ্দেশ্যে প্রদান করা হয়েছে এবং এটি ব্যক্তিগত আর্থিক পরামর্শ নয়। "
+        "কোনো আর্থিক সিদ্ধান্ত নেওয়ার আগে একজন নিবন্ধিত আর্থিক উপদেষ্টার সঙ্গে পরামর্শ করুন।"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ── Googletrans integration ──
+# ---------------------------------------------------------------------------
+
+def _translate_text(text: str) -> str:
+    """Translate a single text string from English to Bangla. Returns original on failure."""
+    if not _GOOGLETRANS_OK or not text or not text.strip():
+        return text
+    try:
+        tr = _GTranslator()
+        result = tr.translate(text, src="en", dest="bn")
+        return result.text if result and result.text else text
+    except Exception:
+        return text
 
 
 def _translate_result_to_bangla(result: dict) -> dict:
     """
-    Translate a structured English result dict into Bangla.
-    Falls back safely if translation is unavailable.
+    Translate a full structured English result dict into Bangla section-by-section.
+    Falls back gracefully on any translation error.
     """
-    if not GOOGLETRANS_AVAILABLE:
-        return _build_bangla_mock_wrapper(result)
-
     try:
-        translator = Translator()
-        translated = dict(result)
+        rec_translated = _translate_text(_s(result.get("recommendation", "")))
+        exp_translated = _translate_text(_s(result.get("explanation", "")))
 
-        translated["recommendation"] = translator.translate(
-            result.get("recommendation", ""), dest="bn"
-        ).text
+        steps = result.get("action_steps", [])
+        if isinstance(steps, list):
+            steps_translated = [_translate_text(_s(step)) for step in steps]
+        else:
+            steps_translated = [_translate_text(_s(steps))]
 
-        translated["action_steps"] = [
-            translator.translate(step, dest="bn").text
-            for step in result.get("action_steps", [])
-            if isinstance(step, str) and step.strip()
-        ]
-
-        translated["explanation"] = translator.translate(
-            result.get("explanation", ""), dest="bn"
-        ).text
-
-        translated["disclaimer"] = translator.translate(
-            result.get("disclaimer", ""), dest="bn"
-        ).text
-
-        return translated
-
+        # Always use canonical Bangla disclaimer rather than translating
+        return {
+            "recommendation": rec_translated,
+            "action_steps": steps_translated,
+            "explanation": exp_translated,
+            "disclaimer": _disclaimer_bn(),
+        }
     except Exception:
-        return _build_bangla_mock_wrapper(result)
-
-
-
-
-def _build_bangla_mock_wrapper(result: dict) -> dict:
-    """Add a Bangla-oriented wrapper without relying on external translation."""
-    wrapped = dict(result)
-    wrapped["recommendation"] = (
-        "**বাংলা মোড নোট:** সম্পূর্ণ বাংলা উত্তর সবসময় স্থিতিশীল নাও হতে পারে। নিচে ব্যবহারযোগ্য আর্থিক পরামর্শ দেওয়া হলো.\n\n"
-        + wrapped.get("recommendation", "")
-    )
-    wrapped["explanation"] = (
-        "এই ব্যাখ্যাটি আপনার আয়, ব্যয়, সঞ্চয়, ঋণ, লক্ষ্য এবং ঝুঁকি সহনশীলতার ভিত্তিতে তৈরি করা হয়েছে। "
-        + wrapped.get("explanation", "")
-    )
-    wrapped["disclaimer"] = _ensure_disclaimer_text("Bangla")
-    return wrapped
+        # Last-resort Bangla wrapper if translation completely fails
+        return {
+            "recommendation": (
+                "**বাংলা অনুবাদ পাওয়া যায়নি।** নিচে ইংরেজিতে পরামর্শ দেওয়া হলো:\n\n"
+                + _s(result.get("recommendation", ""))
+            ),
+            "action_steps": result.get("action_steps", []),
+            "explanation": _s(result.get("explanation", "")),
+            "disclaimer": _disclaimer_bn(),
+        }
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# ── Mock Mode — task generators ──
 # ---------------------------------------------------------------------------
 
-def _load_selected_model():
-    """
-    Lazily load TinyLlama only when needed.
-    Prefers GPU when available and remains safe on CPU-only systems.
-    """
-    global _TOKENIZER, _MODEL, _MODEL_LOAD_ERROR
-
-    if _TOKENIZER is not None and _MODEL is not None:
-        return _TOKENIZER, _MODEL
-
-    if _MODEL_LOAD_ERROR is not None:
-        raise RuntimeError(_MODEL_LOAD_ERROR)
-
-    if not TRANSFORMERS_AVAILABLE:
-        _MODEL_LOAD_ERROR = (
-            "Transformers/PyTorch dependencies are not installed. "
-            "Install: pip install transformers torch accelerate sentencepiece safetensors"
-        )
-        raise RuntimeError(_MODEL_LOAD_ERROR)
-
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
-
-        _TOKENIZER = AutoTokenizer.from_pretrained(SELECTED_MODEL, use_fast=True)
-        if _TOKENIZER.pad_token is None:
-            _TOKENIZER.pad_token = _TOKENIZER.eos_token
-        _TOKENIZER.padding_side = "left"
-
-        model_kwargs = {"torch_dtype": dtype}
-        if device == "cuda":
-            model_kwargs["device_map"] = "auto"
-            model_kwargs["low_cpu_mem_usage"] = True
-
-        _MODEL = AutoModelForCausalLM.from_pretrained(SELECTED_MODEL, **model_kwargs)
-
-        if device != "cuda":
-            _MODEL = _MODEL.to(device)
-
-        _MODEL.eval()
-
-        if getattr(_TOKENIZER, "chat_template", None) is None:
-            _TOKENIZER.chat_template = (
-                "{% for message in messages %}"
-                "{% if message['role'] == 'system' %}<|system|>\n{{ message['content'] }}\n{% endif %}"
-                "{% if message['role'] == 'user' %}<|user|>\n{{ message['content'] }}\n{% endif %}"
-                "{% if message['role'] == 'assistant' %}<|assistant|>\n{{ message['content'] }}\n{% endif %}"
-                "{% endfor %}<|assistant|>\n"
-            )
-
-        return _TOKENIZER, _MODEL
-
-    except Exception as e:
-        _MODEL_LOAD_ERROR = f"Failed to load {SELECTED_MODEL}: {str(e)}"
-        raise RuntimeError(_MODEL_LOAD_ERROR)
-
-
-# ---------------------------------------------------------------------------
-# Mock Mode — Task-specific response generators
-# ---------------------------------------------------------------------------
-
-def _budget_planning_mock(profile: dict) -> dict:
+def _mock_budget(profile: dict) -> dict:
     income = safe_float(profile.get("monthly_income", 0))
     expenses = safe_float(profile.get("monthly_expenses", 0))
     surplus = compute_surplus(income, expenses)
-    savings_rate = compute_savings_rate(income, expenses)
-    goal = profile.get("financial_goal", "your financial goals")
+    rate = compute_savings_rate(income, expenses)
+    goal = _s(profile.get("financial_goal", "your financial goals"))
 
-    if savings_rate >= 20:
-        framework = "50/30/20 rule (50% needs, 30% wants, 20% savings/investments)"
-        budget_note = (
-            f"Your current savings rate of {savings_rate:.1f}% is healthy. "
-            "The 50/30/20 framework will help you maintain this discipline."
-        )
-    elif savings_rate >= 10:
-        framework = "60/20/20 rule (60% needs, 20% wants, 20% savings)"
-        budget_note = (
-            f"Your current savings rate of {savings_rate:.1f}% is moderate. "
-            "Tightening discretionary spending by 10% could significantly "
-            "accelerate progress toward your goal."
-        )
+    if rate >= 20:
+        framework = "50/30/20 rule"
+        note = f"Your savings rate of {rate:.1f}% is strong — maintain this discipline."
+    elif rate >= 10:
+        framework = "60/20/20 rule"
+        note = f"Your savings rate of {rate:.1f}% is moderate. Cutting 10% from discretionary spend could accelerate your progress."
     else:
-        framework = "Zero-based budgeting (every dollar assigned a purpose)"
-        budget_note = (
-            f"Your current savings rate is only {savings_rate:.1f}%, which leaves "
-            "little room for saving or investing. Zero-based budgeting can help you "
-            "identify and cut unnecessary expenses."
-        )
+        framework = "zero-based budgeting"
+        note = f"Your savings rate is only {rate:.1f}%. Zero-based budgeting will help you assign every dollar intentionally."
 
-    needs_target = income * 0.50
-    wants_target = income * 0.30
-    savings_target = income * 0.20
-
-    recommendation = (
-        f"Based on your monthly income of {format_currency(income)} and expenses of "
-        f"{format_currency(expenses)}, your monthly surplus is {format_currency(surplus)}. "
-        f"We recommend the **{framework}** to structure your budget and work towards "
-        f"**{goal}**. {budget_note}"
-    )
-
-    action_steps = [
-        "Track all spending for 30 days using a free budgeting app to get a clear picture of where your money goes.",
-        f"Allocate {format_currency(needs_target)}/mo (50%) to essential needs (rent, food, transport, utilities).",
-        f"Limit discretionary spending to {format_currency(wants_target)}/mo (30%).",
-        f"Direct at least {format_currency(savings_target)}/mo (20%) to a dedicated savings or investment account on payday.",
-        "Review and cancel unused subscriptions — a common source of budget leakage.",
-        "Revisit your budget every month and adjust as income or expenses change.",
-    ]
-
-    health = "strong" if savings_rate >= 20 else "moderate" if savings_rate >= 10 else "limited"
-    explanation = (
-        f"The recommended budget framework is chosen because your monthly surplus of "
-        f"{format_currency(surplus)} ({savings_rate:.1f}% of income) suggests {health} "
-        f"financial headroom. A structured budget ensures consistent progress towards "
-        f"{goal} while keeping lifestyle expenses in check."
-    )
+    needs = income * 0.50
+    wants = income * 0.30
+    save = income * 0.20
 
     return {
-        "recommendation": recommendation,
-        "action_steps": action_steps,
-        "explanation": explanation,
+        "recommendation": (
+            f"Based on your income of {format_currency(income)} and expenses of {format_currency(expenses)}, "
+            f"your monthly surplus is {format_currency(surplus)}. We recommend the **{framework}** "
+            f"to structure your spending and progress toward {goal}. {note}"
+        ),
+        "action_steps": [
+            "Track every expense for 30 days using a free budgeting app.",
+            f"Allocate {format_currency(needs)}/month (50%) to essential needs.",
+            f"Limit wants and discretionary spending to {format_currency(wants)}/month (30%).",
+            f"Transfer {format_currency(save)}/month (20%) to savings on payday.",
+            "Cancel unused subscriptions to free up additional cash each month.",
+            "Review your budget at the end of every month and adjust as needed.",
+        ],
+        "explanation": (
+            f"The {framework} is recommended because your surplus of {format_currency(surplus)} "
+            f"({rate:.1f}% of income) provides {'healthy' if rate >= 20 else 'moderate' if rate >= 10 else 'limited'} "
+            f"financial headroom. A structured framework builds the habit of consistent saving while keeping day-to-day "
+            f"spending sustainable."
+        ),
     }
 
 
-def _savings_strategy_mock(profile: dict) -> dict:
+def _mock_savings(profile: dict) -> dict:
     income = safe_float(profile.get("monthly_income", 0))
     expenses = safe_float(profile.get("monthly_expenses", 0))
     savings = safe_float(profile.get("current_savings", 0))
     surplus = compute_surplus(income, expenses)
-    goal = profile.get("financial_goal", "your savings goal")
-    horizon = profile.get("investment_horizon", "Medium (2-5 years)")
+    goal = _s(profile.get("financial_goal", "your savings goal"))
+    horizon = _s(profile.get("investment_horizon", "Medium (2-5 years)"))
 
     if "Long" in horizon:
-        save_pct = 0.25
-        vehicle = "a high-interest savings account for your emergency fund, then low-cost index ETFs"
+        pct, vehicle = 0.25, "a high-interest savings account for emergencies, then low-cost index ETFs"
     elif "Medium" in horizon:
-        save_pct = 0.20
-        vehicle = "a high-interest savings account and term deposits"
+        pct, vehicle = 0.20, "a high-interest savings account and term deposits"
     else:
-        save_pct = 0.15
-        vehicle = "a dedicated high-interest savings account or offset account"
+        pct, vehicle = 0.15, "a dedicated high-interest savings account or mortgage offset account"
 
-    monthly_save = surplus * save_pct if surplus > 0 else 0
-    annual_save = monthly_save * 12
-    emergency_fund_target = expenses * 3
-
-    recommendation = (
-        f"With a monthly surplus of {format_currency(surplus)}, we recommend saving at least "
-        f"**{format_currency(monthly_save)}/month** ({save_pct * 100:.0f}% of surplus) into "
-        f"{vehicle}. This will help you build toward {goal}. "
-        f"Over 12 months, you could accumulate approximately {format_currency(annual_save)} "
-        f"in new savings on top of your existing {format_currency(savings)}."
-    )
-
-    action_steps = [
-        f"Build an emergency fund of {format_currency(emergency_fund_target)} (3 months of expenses) before investing.",
-        "Open a dedicated savings account separate from your everyday spending account.",
-        f"Set up an automatic transfer of {format_currency(monthly_save)} on payday ('pay yourself first').",
-        f"Once the emergency fund is complete, direct additional savings to {vehicle}.",
-        "Avoid dipping into savings for non-emergency purchases.",
-        "Reassess your savings rate every 6 months as your income grows.",
-    ]
-
-    horizon_label = horizon.split("(")[0].strip().lower()
-    explanation = (
-        f"Your {horizon.lower()} investment horizon guides the choice of savings vehicle. "
-        f"For a {horizon_label} horizon, liquidity and capital preservation are prioritised, "
-        f"making {vehicle} appropriate. The {save_pct * 100:.0f}% target is calibrated to your "
-        f"current surplus of {format_currency(surplus)}/month."
-    )
+    monthly = max(surplus * pct, 0)
+    ef = expenses * 3
 
     return {
-        "recommendation": recommendation,
-        "action_steps": action_steps,
-        "explanation": explanation,
+        "recommendation": (
+            f"With a monthly surplus of {format_currency(surplus)}, we recommend saving "
+            f"**{format_currency(monthly)}/month** ({pct * 100:.0f}% of surplus) into {vehicle}. "
+            f"This positions you to reach {goal}. Over 12 months you would accumulate roughly "
+            f"{format_currency(monthly * 12)} on top of your existing {format_currency(savings)}."
+        ),
+        "action_steps": [
+            f"Build an emergency fund of {format_currency(ef)} (3 months of expenses) first.",
+            "Open a dedicated savings account separate from your everyday account.",
+            f"Set up an automatic transfer of {format_currency(monthly)} on payday.",
+            f"Once the emergency fund is complete, direct surplus into {vehicle}.",
+            "Do not withdraw savings for non-emergency spending.",
+            "Reassess your savings rate every 6 months as income grows.",
+        ],
+        "explanation": (
+            f"A {horizon.lower()} horizon calls for {vehicle.split(',')[0]}. "
+            f"The {pct * 100:.0f}% target is calibrated to your current surplus of "
+            f"{format_currency(surplus)}/month, ensuring the goal remains achievable without "
+            f"straining your monthly budget."
+        ),
     }
 
 
-def _debt_management_mock(profile: dict) -> dict:
+def _mock_debt(profile: dict) -> dict:
     income = safe_float(profile.get("monthly_income", 0))
     expenses = safe_float(profile.get("monthly_expenses", 0))
     debt = safe_float(profile.get("current_debt", 0))
     surplus = compute_surplus(income, expenses)
     dti = compute_debt_to_income_ratio(debt, income)
-    goal = profile.get("financial_goal", "become debt-free")
-
-    if dti > 5:
-        urgency, strategy, monthly_debt_pct = "high", "Debt Avalanche", 0.40
-    elif dti > 2:
-        urgency, strategy, monthly_debt_pct = "moderate", "Debt Snowball", 0.30
-    else:
-        urgency, strategy, monthly_debt_pct = "manageable", "balanced repayment", 0.20
-
-    monthly_debt_payment = surplus * monthly_debt_pct if surplus > 0 else 0
+    goal = _s(profile.get("financial_goal", "become debt-free"))
 
     if debt == 0:
-        recommendation = (
-            "You currently have no reported debt — well done! "
-            f"Focus on building your emergency fund and then working towards {goal}."
-        )
-        action_steps = [
-            "Maintain a zero-debt policy by paying credit card balances in full each month.",
-            "Redirect funds that would go to debt repayment into a savings or investment account.",
-            "Build an emergency fund (3–6 months of expenses) to avoid future debt.",
-        ]
-        explanation = (
-            "With no current debt, your financial foundation is solid. "
-            "The focus should be on maintaining this position and building wealth steadily."
-        )
-    else:
-        months_to_clear = (debt / monthly_debt_payment) if monthly_debt_payment > 0 else 999
-        recommendation = (
-            f"Your debt-to-income ratio is **{dti:.1f}x** monthly income, which is {urgency}. "
-            f"We recommend the **{strategy}** method to work towards {goal}. "
-            f"Allocating {format_currency(monthly_debt_payment)}/month to debt repayment "
-            f"could clear your debt in approximately **{months_to_clear:.0f} months** "
-            "(simplified estimate, excluding interest)."
-        )
-        action_steps = [
-            "List all debts with their interest rates and minimum repayments.",
-            "Pay the minimum on all debts every month to avoid penalties.",
-            f"Allocate {format_currency(monthly_debt_payment)}/month as your extra repayment using the {strategy} approach.",
-            "Contact lenders to ask about lower interest rates or hardship support if needed.",
-            "Avoid taking on any new debt while paying down existing obligations.",
-            "Once debt-free, redirect the repayment amount into savings or investments.",
-        ]
+        return {
+            "recommendation": (
+                f"You have no reported debt — excellent position! "
+                f"With a monthly surplus of {format_currency(surplus)}, "
+                f"focus entirely on building savings and working toward {goal}."
+            ),
+            "action_steps": [
+                "Pay credit card balances in full every month to stay debt-free.",
+                "Build a 3–6 month emergency fund to avoid future debt.",
+                "Redirect what would have been debt repayments into a savings or investment account.",
+            ],
+            "explanation": (
+                "With zero debt your financial foundation is strong. The priority now is building "
+                "wealth steadily while maintaining the zero-debt position."
+            ),
+        }
 
-        if urgency == "high":
-            extra = "it minimises total interest paid over time."
-        elif urgency == "moderate":
-            extra = "it builds motivational momentum through early wins."
-        else:
-            extra = "your debt level allows a balanced approach without sacrificing savings."
-        explanation = (
-            f"A debt-to-income ratio of {dti:.1f}x monthly income indicates {urgency} debt pressure. "
-            f"The {strategy} strategy is appropriate because {extra}"
-        )
+    if dti > 5:
+        urgency, strategy, pct = "high", "Debt Avalanche (highest interest first)", 0.40
+    elif dti > 2:
+        urgency, strategy, pct = "moderate", "Debt Snowball (smallest balance first)", 0.30
+    else:
+        urgency, strategy, pct = "manageable", "balanced repayment plan", 0.20
+
+    payment = max(surplus * pct, 0)
+    months = (debt / payment) if payment > 0 else 999
 
     return {
-        "recommendation": recommendation,
-        "action_steps": action_steps,
-        "explanation": explanation,
+        "recommendation": (
+            f"Your debt-to-income ratio is **{dti:.1f}x** monthly income — {urgency} pressure. "
+            f"We recommend the **{strategy}** to work toward {goal}. "
+            f"Allocating {format_currency(payment)}/month as your extra repayment could clear "
+            f"your debt in approximately **{months:.0f} months** (excluding interest)."
+        ),
+        "action_steps": [
+            "List all debts, their interest rates, and minimum monthly repayments.",
+            "Pay the minimum on every debt each month without exception.",
+            f"Direct {format_currency(payment)}/month as an extra repayment using the {strategy}.",
+            "Contact lenders to request lower interest rates or hardship assistance.",
+            "Avoid taking on any new debt while repaying existing obligations.",
+            "Once debt-free, redirect the repayment amount into savings or investments.",
+        ],
+        "explanation": (
+            f"A debt-to-income ratio of {dti:.1f}x indicates {urgency} financial pressure. "
+            f"The {strategy} is appropriate because "
+            + ("it minimises total interest paid over time." if urgency == "high"
+               else "it builds early momentum through quick wins." if urgency == "moderate"
+               else "your debt level allows a balanced approach without sacrificing savings.")
+        ),
     }
 
 
-def _investment_guidance_mock(profile: dict) -> dict:
+def _mock_invest(profile: dict) -> dict:
     income = safe_float(profile.get("monthly_income", 0))
     expenses = safe_float(profile.get("monthly_expenses", 0))
     debt = safe_float(profile.get("current_debt", 0))
-    risk = profile.get("risk_tolerance", "Medium")
-    horizon = profile.get("investment_horizon", "Medium (2-5 years)")
-    goal = profile.get("financial_goal", "grow your wealth")
-    age = safe_float(profile.get("age", 25))
+    risk = _s(profile.get("risk_tolerance", "Medium"))
+    horizon = _s(profile.get("investment_horizon", "Medium (2-5 years)"))
+    goal = _s(profile.get("financial_goal", "grow wealth"))
+    age = int(safe_float(profile.get("age", 25)))
     surplus = compute_surplus(income, expenses)
 
-    risk_map = {
-        "Low": {
-            "vehicles": "high-interest savings accounts, government bonds, and term deposits",
-            "allocation": "80% defensive assets and 20% growth assets",
-            "note": "Capital preservation is the priority.",
-        },
-        "Medium": {
-            "vehicles": "diversified ETFs and balanced funds",
-            "allocation": "50% growth assets and 50% defensive assets",
-            "note": "Balanced growth with moderate risk.",
-        },
-        "High": {
-            "vehicles": "growth ETFs, diversified equity exposure, and growth-oriented listed funds",
-            "allocation": "80% growth assets and 20% defensive assets",
-            "note": "Higher potential returns come with higher short-term volatility.",
-        },
+    profiles = {
+        "Low":    ("high-interest savings accounts, government bonds, and term deposits",
+                   "80% defensive / 20% growth", "Capital preservation is the priority."),
+        "Medium": ("diversified index ETFs and balanced managed funds",
+                   "50% growth / 50% defensive", "Balanced growth with moderate volatility."),
+        "High":   ("growth-oriented ETFs and diversified equity funds",
+                   "80% growth / 20% defensive", "Higher potential returns, higher short-term volatility."),
     }
-
-    selected_profile = risk_map.get(risk, risk_map["Medium"])
-    monthly_inv = surplus * 0.20 if surplus > 0 else 0
+    vehicles, allocation, note = profiles.get(risk, profiles["Medium"])
+    monthly_inv = max(surplus * 0.20, 0)
     dti = compute_debt_to_income_ratio(debt, income)
-    debt_warning = (
-        " **Important:** Your current debt level suggests you should prioritise debt repayment before investing, "
-        "as many debt interest rates exceed typical long-term investment returns."
+    debt_warn = (
+        " **Note:** With a high debt-to-income ratio, prioritise debt repayment before investing."
         if dti > 3 else ""
     )
 
-    recommendation = (
-        f"As a beginner investor with **{risk.lower()} risk tolerance** and a "
-        f"**{horizon.lower()} horizon**, we recommend starting with "
-        f"**{selected_profile['vehicles']}**. "
-        f"A suggested allocation is {selected_profile['allocation']}. "
-        f"Consider investing {format_currency(monthly_inv)}/month consistently "
-        f"to work towards {goal}.{debt_warning}"
-    )
-
-    action_steps = [
-        "Ensure you have at least 3 months of expenses saved as an emergency fund before investing.",
-        "Open a low-fee brokerage or investment account appropriate to your needs.",
-        f"Start with {selected_profile['vehicles']} — beginner-friendly and diversified options.",
-        f"Invest {format_currency(monthly_inv)}/month consistently using dollar-cost averaging.",
-        f"Follow a {selected_profile['allocation']} portfolio approach.",
-        "Reinvest distributions where appropriate to compound long-term returns.",
-        "Review your portfolio every 6–12 months rather than reacting to short-term market moves.",
-        "Use reputable educational resources before making major investment decisions.",
-    ]
-
-    age_note = "substantial" if age < 40 else "moderate"
-    horizon_label = horizon.split("(")[0].strip().lower()
-    explanation = (
-        f"The recommended approach is tailored to your {risk.lower()} risk tolerance and "
-        f"{horizon_label} investment horizon. At age {int(age)}, you have {age_note} time "
-        f"to benefit from compounding. {selected_profile['note']} Starting with diversified "
-        "investment options reduces single-asset risk, which is appropriate for a beginner investor."
-    )
-
     return {
-        "recommendation": recommendation,
-        "action_steps": action_steps,
-        "explanation": explanation,
+        "recommendation": (
+            f"As a beginner investor with **{risk.lower()} risk tolerance** and a "
+            f"**{horizon.lower()} horizon**, start with **{vehicles}**. "
+            f"A target allocation of {allocation} is appropriate. "
+            f"Invest {format_currency(monthly_inv)}/month consistently to progress toward {goal}.{debt_warn}"
+        ),
+        "action_steps": [
+            "Build a 3-month emergency fund before committing money to investments.",
+            "Open a low-fee brokerage account suitable for beginners.",
+            f"Start investing in {vehicles}.",
+            f"Invest {format_currency(monthly_inv)}/month using dollar-cost averaging.",
+            f"Maintain a {allocation} portfolio allocation.",
+            "Reinvest dividends/distributions to compound returns over time.",
+            "Review your portfolio annually — avoid reacting to short-term market moves.",
+        ],
+        "explanation": (
+            f"The recommended approach suits your {risk.lower()} risk tolerance and {horizon.lower()} horizon. "
+            f"At age {age}, you have {'substantial' if age < 40 else 'meaningful'} time to benefit from compounding. "
+            f"{note} Beginning with diversified options reduces single-asset risk, which is appropriate for a new investor."
+        ),
     }
 
 
 def _generate_mock_response(profile: dict, task_type: str, language: str) -> dict:
-    """Route to the correct task-specific mock response generator."""
-    generators = {
-        "Budget Planning": _budget_planning_mock,
-        "Savings Strategy": _savings_strategy_mock,
-        "Debt Management": _debt_management_mock,
-        "Beginner Investment Guidance": _investment_guidance_mock,
+    """Generate a mock structured response and optionally translate to Bangla."""
+    _generators = {
+        "Budget Planning": _mock_budget,
+        "Savings Strategy": _mock_savings,
+        "Debt Management": _mock_debt,
+        "Beginner Investment Guidance": _mock_invest,
     }
-
-    result = generators.get(task_type, _budget_planning_mock)(profile)
-    result["disclaimer"] = (
-        "This recommendation is generated for educational purposes as part of COMP8420 Assignment 2. "
-        "It is not personalised financial advice. Please consult a registered financial adviser "
-        "before making any financial decisions."
-    )
+    result = _generators.get(task_type, _mock_budget)(profile)
+    result["disclaimer"] = _disclaimer_en()
 
     if language == "Bangla":
         result = _translate_result_to_bangla(result)
@@ -504,51 +390,127 @@ def _generate_mock_response(profile: dict, task_type: str, language: str) -> dic
 
 
 # ---------------------------------------------------------------------------
-# TinyLlama — Prompt builders
+# ── Model loading ──
 # ---------------------------------------------------------------------------
 
-def _build_tinyllama_messages(prompt: dict, profile: dict, language: str) -> tuple:
-    """
-    Build concise, task-specific chat messages and a priming prefix for TinyLlama.
-    The prompt is intentionally short to reduce instruction echoing.
-    """
+def _load_model():
+    """Lazily load TinyLlama. Returns (tokenizer, model). Raises on failure."""
+    global _tok, _mdl, _load_err
+
+    if _tok is not None and _mdl is not None:
+        return _tok, _mdl
+
+    if _load_err is not None:
+        raise RuntimeError(_load_err)
+
+    if not _TRANSFORMERS_OK:
+        _load_err = (
+            "PyTorch / Transformers not installed. "
+            "Run: pip install transformers torch accelerate sentencepiece safetensors"
+        )
+        raise RuntimeError(_load_err)
+
+    try:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if device == "cuda" else torch.float32
+
+        _tok = AutoTokenizer.from_pretrained(_SELECTED_MODEL, use_fast=True)
+        if _tok.pad_token is None:
+            _tok.pad_token = _tok.eos_token
+        _tok.padding_side = "left"
+        if getattr(_tok, "chat_template", None) is None:
+            _tok.chat_template = _FALLBACK_CHAT_TEMPLATE
+
+        kwargs = {"torch_dtype": dtype}
+        if device == "cuda":
+            kwargs["device_map"] = "auto"
+            kwargs["low_cpu_mem_usage"] = True
+
+        _mdl = AutoModelForCausalLM.from_pretrained(_SELECTED_MODEL, **kwargs)
+        if device != "cuda":
+            _mdl = _mdl.to(device)
+        _mdl.eval()
+
+        return _tok, _mdl
+
+    except Exception as exc:
+        _load_err = f"Failed to load {_SELECTED_MODEL}: {exc}"
+        raise RuntimeError(_load_err)
+
+
+# ---------------------------------------------------------------------------
+# ── TinyLlama prompting — English only, always ──
+# ---------------------------------------------------------------------------
+
+def _profile_summary(profile: dict) -> str:
     income = safe_float(profile.get("monthly_income", 0))
     expenses = safe_float(profile.get("monthly_expenses", 0))
-    savings = safe_float(profile.get("current_savings", 0))
-    debt = safe_float(profile.get("current_debt", 0))
     surplus = compute_surplus(income, expenses)
-    age = int(safe_float(profile.get("age", 25)))
-    risk = _safe_text(profile.get("risk_tolerance", "Medium"), "Medium")
-    goal = _safe_text(profile.get("financial_goal", "improve finances"), "improve finances")
-    horizon = _safe_text(profile.get("investment_horizon", "Medium (2-5 years)"), "Medium (2-5 years)")
-    employment = _safe_text(profile.get("employment_status", "Not stated"), "Not stated")
-    extras = _safe_text(profile.get("extra_preferences", "None stated"), "None stated")
-    task = _safe_text(prompt.get("task_type", "Budget Planning"), "Budget Planning")
-
-    if language == "Bangla":
-        language_instruction = (
-            "Write the answer mostly in simple Bangla. Keep the section labels in English exactly as given. "
-            "You may keep financial terms like budget, savings, debt, ETF, or risk in English if needed."
-        )
-    else:
-        language_instruction = "Write the answer in clear English."
-
-    system_prompt = (
-        "You are a practical finance assistant. Use only the profile facts provided. "
-        "Do not copy the prompt. Do not repeat the profile line by line. "
-        "Do not use placeholders or square brackets. "
-        "Write all four sections with real content. "
-        "Make the advice specific, short, and useful."
+    return (
+        f"age {int(safe_float(profile.get('age', 25)))}; "
+        f"employment: {_s(profile.get('employment_status', 'unknown'))}; "
+        f"income {_amt(income)}/month; "
+        f"expenses {_amt(expenses)}/month; "
+        f"surplus {_amt(surplus)}/month; "
+        f"savings {_amt(profile.get('current_savings', 0))}; "
+        f"debt {_amt(profile.get('current_debt', 0))}; "
+        f"risk tolerance: {_s(profile.get('risk_tolerance', 'Medium'))}; "
+        f"goal: {_s(profile.get('financial_goal', 'improve finances'))}; "
+        f"horizon: {_s(profile.get('investment_horizon', 'Medium (2-5 years)'))}; "
+        f"preferences: {_s(profile.get('extra_preferences', 'none'))}"
     )
 
-    user_content = (
-        f"Task: {task}\n"
-        f"Profile: age {age}; employment {employment}; income {_format_amount(income)}/month; "
-        f"expenses {_format_amount(expenses)}/month; surplus {_format_amount(surplus)}/month; "
-        f"savings {_format_amount(savings)}; debt {_format_amount(debt)}; risk {risk}; "
-        f"goal {goal}; horizon {horizon}; extra preferences {extras}.\n"
-        f"{language_instruction}\n"
-        "Give practical personal finance advice with exactly these sections:\n"
+
+def _task_focus(task_type: str) -> str:
+    focuses = {
+        "Budget Planning": (
+            "Give a personalised monthly budget plan using the income and expense figures above. "
+            "Recommend a specific budgeting framework. "
+            "Do NOT recommend stocks, ETFs, or investment products unless the surplus is explicitly large."
+        ),
+        "Savings Strategy": (
+            "Give a personalised savings strategy. Recommend a specific monthly savings target and vehicle. "
+            "Include an emergency fund target based on the expenses figure."
+        ),
+        "Debt Management": (
+            "Give a personalised debt repayment plan using the debt and surplus figures. "
+            "Recommend a repayment strategy and estimate a realistic payoff timeline. "
+            "Do NOT recommend investing while debt is the focus."
+        ),
+        "Beginner Investment Guidance": (
+            "Give beginner-friendly investment guidance based on risk tolerance and investment horizon. "
+            "Recommend specific investment vehicles suitable for a beginner. "
+            "Use the surplus figure for a monthly investment amount."
+        ),
+    }
+    return focuses.get(task_type, focuses["Budget Planning"])
+
+
+def _build_messages(profile: dict, task_type: str) -> tuple:
+    """
+    Build English-only TinyLlama chat messages.
+    Returns (messages_list, priming_prefix).
+    """
+    system = (
+        "You are a practical personal finance assistant. "
+        "Write complete, specific financial advice using only the profile facts given. "
+        "Never invent numbers, interest rates, weekly values, or amounts not in the profile. "
+        "Never use placeholders like [Name], [Amount], or [X%]. "
+        "Never copy these instructions into your answer. "
+        "Never repeat the profile line by line. "
+        "Never leave a section heading empty. "
+        "Always write all four sections with real content."
+    )
+
+    income = safe_float(profile.get("monthly_income", 0))
+    expenses = safe_float(profile.get("monthly_expenses", 0))
+    surplus = compute_surplus(income, expenses)
+
+    user = (
+        f"Task: {task_type}\n"
+        f"Profile: {_profile_summary(profile)}\n\n"
+        f"Focus: {_task_focus(task_type)}\n\n"
+        "Write the answer in English with exactly these four sections:\n"
         "RECOMMENDATION:\n"
         "ACTION STEPS:\n"
         "1.\n2.\n3.\n4.\n"
@@ -557,56 +519,39 @@ def _build_tinyllama_messages(prompt: dict, profile: dict, language: str) -> tup
     )
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
     ]
 
-    priming = "RECOMMENDATION: Based on your current finances, "
+    priming = (
+        f"RECOMMENDATION: Based on your income of {_amt(income)} and expenses of "
+        f"{_amt(expenses)}, your surplus is {_amt(surplus)}. "
+    )
+
     return messages, priming
 
 
-def _build_tinyllama_repair_messages(prompt: dict, profile: dict, language: str) -> tuple:
+def _build_repair_messages(profile: dict, task_type: str) -> tuple:
     """
-    Build a stricter repair prompt after a low-quality first pass.
-    This prompt tells the model to rewrite the answer fully and correctly.
+    Build a stricter English-only repair prompt for second-pass generation.
     """
     income = safe_float(profile.get("monthly_income", 0))
     expenses = safe_float(profile.get("monthly_expenses", 0))
-    savings = safe_float(profile.get("current_savings", 0))
-    debt = safe_float(profile.get("current_debt", 0))
     surplus = compute_surplus(income, expenses)
-    age = int(safe_float(profile.get("age", 25)))
-    risk = _safe_text(profile.get("risk_tolerance", "Medium"), "Medium")
-    goal = _safe_text(profile.get("financial_goal", "improve finances"), "improve finances")
-    horizon = _safe_text(profile.get("investment_horizon", "Medium (2-5 years)"), "Medium (2-5 years)")
-    employment = _safe_text(profile.get("employment_status", "Not stated"), "Not stated")
-    extras = _safe_text(profile.get("extra_preferences", "None stated"), "None stated")
-    task = _safe_text(prompt.get("task_type", "Budget Planning"), "Budget Planning")
 
-    if language == "Bangla":
-        language_instruction = (
-            "Rewrite the full answer mostly in simple Bangla. Keep section labels in English. "
-            "Do not switch back to English except for short finance terms when necessary."
-        )
-    else:
-        language_instruction = "Rewrite the full answer in clear English."
-
-    system_prompt = (
-        "The previous answer was low quality. Rewrite it fully. "
-        "Use only the profile facts below. "
+    system = (
+        "The previous answer was incomplete or low quality. "
+        "Rewrite it fully using only the profile facts below. "
         "No placeholders. No copied instructions. No empty headings. "
-        "Recommendation must be specific. Action steps must be useful. "
-        "Explanation and disclaimer must be complete."
+        "Do not invent any number, rate, or value not given in the profile. "
+        "Write all four sections completely."
     )
 
-    user_content = (
-        f"Rewrite {task} advice for this profile:\n"
-        f"age {age}; employment {employment}; income {_format_amount(income)}/month; "
-        f"expenses {_format_amount(expenses)}/month; surplus {_format_amount(surplus)}/month; "
-        f"savings {_format_amount(savings)}; debt {_format_amount(debt)}; risk {risk}; "
-        f"goal {goal}; horizon {horizon}; extra preferences {extras}.\n"
-        f"{language_instruction}\n"
-        "Return all four sections only:\n"
+    user = (
+        f"Rewrite {task_type} advice for:\n"
+        f"{_profile_summary(profile)}\n\n"
+        f"Focus: {_task_focus(task_type)}\n\n"
+        "Return all four sections in English:\n"
         "RECOMMENDATION:\n"
         "ACTION STEPS:\n"
         "1.\n2.\n3.\n4.\n"
@@ -615,304 +560,285 @@ def _build_tinyllama_repair_messages(prompt: dict, profile: dict, language: str)
     )
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
     ]
 
-    if language == "Bangla":
-        priming = (
-            f"RECOMMENDATION: আপনার মাসিক আয় {_format_amount(income)} এবং ব্যয় {_format_amount(expenses)} হওয়ায় "
-        )
-    else:
-        priming = (
-            f"RECOMMENDATION: Given your monthly income of {_format_amount(income)} and expenses of {_format_amount(expenses)}, "
-        )
+    priming = (
+        f"RECOMMENDATION: Given income of {_amt(income)}, expenses of {_amt(expenses)}, "
+        f"and surplus of {_amt(surplus)}, "
+    )
 
     return messages, priming
 
 
 # ---------------------------------------------------------------------------
-# TinyLlama — Output parser
+# ── TinyLlama output parser ──
 # ---------------------------------------------------------------------------
 
-def _parse_tinyllama_output(text: str, language: str = "English") -> dict:
+def _parse(raw: str) -> dict:
     """
-    Parse raw TinyLlama output into structured sections.
-    Handles imperfect formatting and recovers useful content where possible.
+    Parse raw model output into recommendation / action_steps / explanation / disclaimer.
+    Handles imperfect formatting; recovers useful content where possible.
     """
-    text = _clean_generated_text(_safe_text(text))
+    text = _clean(raw)
 
-    recommendation = ""
-    action_steps = []
-    explanation = ""
-    disclaimer = ""
-
-    section_pattern = re.compile(
+    # Extract named sections via regex
+    pattern = re.compile(
         r"(?is)(RECOMMENDATION|ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:?\s*"
         r"(.*?)(?=(?:\n\s*(?:RECOMMENDATION|ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:)|\Z)"
     )
+    secs = {
+        m.group(1).upper().replace(" ", "_"): m.group(2).strip()
+        for m in pattern.finditer(text)
+    }
 
-    sections = {}
-    for label, content in section_pattern.findall(text):
-        sections[label.upper().replace(" ", "_")] = content.strip()
+    recommendation = secs.get("RECOMMENDATION", "")
+    action_block   = secs.get("ACTION_STEPS", "")
+    explanation    = secs.get("EXPLANATION", "")
+    disclaimer     = secs.get("DISCLAIMER", "")
 
-    recommendation = sections.get("RECOMMENDATION", "")
-    action_block = sections.get("ACTION_STEPS", "")
-    explanation = sections.get("EXPLANATION", "")
-    disclaimer = sections.get("DISCLAIMER", "")
-
+    # Parse action steps
+    action_steps = []
     if action_block:
         for line in action_block.splitlines():
-            line = _strip_label(line)
-            if line and len(line.split()) >= 3 and "recommendation" not in line.lower():
-                action_steps.append(line)
+            step = _strip_bullet(line)
+            if step and len(step.split()) >= 3 and "recommendation" not in step.lower():
+                action_steps.append(step)
 
+    # Fallback: numbered lines anywhere in text
     if not action_steps:
         for line in text.splitlines():
-            stripped = line.strip()
-            if re.match(r"^\d+[\.\)]\s+", stripped):
-                cleaned = _strip_label(stripped)
-                if cleaned and len(cleaned.split()) >= 3:
-                    action_steps.append(cleaned)
+            if re.match(r"^\d+[\.\)]\s+", line.strip()):
+                step = _strip_bullet(line.strip())
+                if step and len(step.split()) >= 3:
+                    action_steps.append(step)
 
+    # Trim excessive steps
+    if len(action_steps) > 6:
+        action_steps = action_steps[:6]
+
+    # Fallback recommendation from first long paragraph
     if not recommendation or len(recommendation.split()) < 12:
-        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-        for para in paragraphs:
+        for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
             upper = para.upper()
-            if not upper.startswith("ACTION") and not upper.startswith("EXPLANATION") and not upper.startswith("DISCLAIMER"):
+            if not any(upper.startswith(h) for h in ("ACTION", "EXPLANATION", "DISCLAIMER")):
                 if len(para.split()) >= 12:
                     recommendation = para
                     break
 
+    # Trim recommendation to only its own section
     if recommendation:
-        recommendation = re.split(r"\n\s*(?:ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:?", recommendation)[0].strip()
+        recommendation = re.split(
+            r"\n\s*(?:ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:?",
+            recommendation
+        )[0].strip()
 
+    # Fallback explanation
     if not explanation or len(explanation.split()) < 8:
         for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
-            upper = para.upper()
-            if "because" in para.lower() or "based on" in para.lower() or "কারণ" in para:
+            if ("because" in para.lower() or "based on" in para.lower()) and len(para.split()) >= 8:
+                upper = para.upper()
                 if not upper.startswith("RECOMMENDATION") and not upper.startswith("ACTION"):
                     explanation = para
                     break
 
+    # Fallback disclaimer
     if not disclaimer:
         for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
-            low = para.lower()
-            if "educational" in low or "financial advice" in low or "উপদেষ্টা" in para or "শিক্ষামূলক" in para:
+            if "educational" in para.lower() or "financial advice" in para.lower():
                 disclaimer = para
                 break
 
-    recommendation = recommendation.strip()
-    explanation = explanation.strip()
-    disclaimer = disclaimer.strip()
-
-    if len(action_steps) > 6:
-        action_steps = action_steps[:6]
-
     if not explanation:
         explanation = (
-            "This advice is based on the user's income, expenses, debt, savings, financial goal, "
-            "investment horizon, and risk tolerance."
-            if language != "Bangla"
-            else "এই পরামর্শটি ব্যবহারকারীর আয়, ব্যয়, ঋণ, সঞ্চয়, লক্ষ্য, সময়সীমা এবং ঝুঁকি সহনশীলতার ভিত্তিতে তৈরি।"
+            "This advice is based on the user's income, expenses, savings, debt, "
+            "financial goal, investment horizon, and risk tolerance."
         )
 
     if not disclaimer:
-        disclaimer = _ensure_disclaimer_text(language)
+        disclaimer = _disclaimer_en()
 
     return {
-        "recommendation": recommendation,
-        "action_steps": action_steps,
-        "explanation": explanation,
-        "disclaimer": disclaimer,
+        "recommendation": recommendation.strip(),
+        "action_steps":   action_steps,
+        "explanation":    explanation.strip(),
+        "disclaimer":     disclaimer.strip(),
     }
 
 
 # ---------------------------------------------------------------------------
-# TinyLlama — Quality checker
+# ── Quality checker ──
 # ---------------------------------------------------------------------------
 
-def _is_low_quality_tinyllama_output(raw_text: str, parsed: dict) -> bool:
+_JUNK_PATTERNS = [
+    r"\[[^\]]+\]",
+    r"\bplaceholder\b",
+    r"\byour name\b",
+    r"\binsert\b",
+    r"write 4 (action|step)",
+    r"write the answer",
+    r"use only the profile",
+    r"return all four sections",
+    r"do not (copy|repeat|invent|use placeholder)",
+    # hallucination pattern: invented weekly amounts
+    r"\$[\d,]+\s*per week",
+    # invented percentages not matching any profile field
+    r"\b[3-9][0-9]%\s*(interest|return|yield)",
+]
+
+_JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE)
+
+
+def _is_poor(raw: str, parsed: dict) -> bool:
     """
-    Return True if output is too poor to show directly.
-
-    Balanced checks:
-    - rejects placeholders, instruction echoes, empty sections, and trivial outputs
-    - allows imperfect but usable answers to pass
+    Return True if output quality is too low to show.
+    Balanced — avoids rejecting imperfect but usable responses.
     """
-    text_lower = _safe_text(raw_text).lower()
-    recommendation = _safe_text(parsed.get("recommendation", ""))
-    explanation = _safe_text(parsed.get("explanation", ""))
-    disclaimer = _safe_text(parsed.get("disclaimer", ""))
-    action_steps = parsed.get("action_steps", [])
+    low = raw.lower() if raw else ""
 
-    placeholder_patterns = [
-        r"\[[^\]]+\]",
-        r"\bplaceholder\b",
-        r"\byour name\b",
-        r"\binsert\b",
-        r"\bwrite 4\b",
-        r"\bwrite the answer\b",
-        r"\buse only the profile facts\b",
-        r"\breturn all four sections\b",
-        r"\bdo not copy the prompt\b",
+    if _JUNK_RE.search(low):
+        return True
+
+    if len(low.split()) < 45:
+        return True
+
+    rec = _s(parsed.get("recommendation", ""))
+    if len(rec.split()) < 8:
+        return True
+
+    steps = [
+        st for st in parsed.get("action_steps", [])
+        if isinstance(st, str) and len(st.split()) >= 4
+        and "action steps" not in st.lower()
     ]
-    for pattern in placeholder_patterns:
-        if re.search(pattern, text_lower):
-            return True
-
-    if len(text_lower.split()) < 25:
+    if len(steps) < 3:
         return True
 
-    if len(recommendation.split()) < 5:
+    exp = _s(parsed.get("explanation", ""))
+    if len(exp.split()) < 6:
         return True
-
-    useful_steps = [
-        step for step in action_steps
-        if isinstance(step, str) and len(step.split()) >= 4 and "action steps" not in step.lower()
-    ]
-    if len(useful_steps) < 2:
-        return True
-
-    if len(explanation.split()) < 4:
-        return True
-
-    if len(disclaimer.split()) < 4:
-        return True
-
-    heading_only_patterns = [
-        "recommendation:",
-        "action steps:",
-        "explanation:",
-        "disclaimer:",
-    ]
-    for heading in heading_only_patterns:
-        if text_lower.count(heading) >= 2 and len(text_lower.replace(heading, "").strip().split()) < 25:
-            return True
 
     return False
 
 
 # ---------------------------------------------------------------------------
-# Selected Model — Real TinyLlama inference with quality check + repair
+# ── TinyLlama inference helper ──
 # ---------------------------------------------------------------------------
 
-def _generate_selected_model_response(profile: dict, prompt: dict, language: str) -> dict:
-    """
-    Run real TinyLlama inference with one repair pass.
-    Falls back to a structured mock response only as a last resort.
-    """
-    task_type = prompt.get("task_type", "Budget Planning")
+def _infer(messages: list, priming: str, temperature: float, top_p: float) -> str:
+    """Run a single TinyLlama forward pass and return decoded text."""
+    tok, mdl = _load_model()
 
-    def _run_inference(messages: list, priming: str, temperature: float, top_p: float) -> str:
-        tokenizer, model = _load_selected_model()
+    formatted = tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    ) + priming
 
-        formatted = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+    inputs = tok(
+        formatted,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1024,
+    )
+    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        out = mdl.generate(
+            **inputs,
+            max_new_tokens=400,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            eos_token_id=tok.eos_token_id,
+            pad_token_id=tok.eos_token_id,
         )
-        primed_formatted = formatted + priming
 
-        inputs = tokenizer(
-            primed_formatted,
-            return_tensors="pt",
-            truncation=True,
-            max_length=1024,
-        )
-        inputs = {k: v.to(model.device) for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[1]
+    new_ids = out[0][input_len:]
+    raw = tok.decode(new_ids, skip_special_tokens=True).strip()
+    return _clean(priming + raw)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=380,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=1.15,
-                no_repeat_ngram_size=3,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id,
+
+# ---------------------------------------------------------------------------
+# ── TinyLlama main generation flow ──
+# ---------------------------------------------------------------------------
+
+def _generate_tinyllama(profile: dict, prompt: dict, language: str) -> dict:
+    """
+    Full TinyLlama generation flow:
+    1. English-only first pass
+    2. Quality check
+    3. English-only repair pass if needed
+    4. Fallback to mock if repair also fails
+    5. Translate to Bangla if language == "Bangla"
+    """
+    task_type = _s(prompt.get("task_type", "Budget Planning"))
+
+    def _fallback(reason: str) -> dict:
+        fb = _generate_mock_response(profile, task_type, "English")  # get English first
+        if language == "Bangla":
+            fb_bn = _translate_result_to_bangla(fb)
+            fb_bn["recommendation"] = (
+                f"**মডেল আউটপুট পাওয়া যায়নি ({reason}) — নির্ভরযোগ্য বিকল্প উত্তর দেওয়া হচ্ছে।**\n\n"
+                + fb_bn["recommendation"]
             )
-
-        new_tokens = outputs[0][input_len:]
-        raw_completion = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        return _clean_generated_text(priming + raw_completion)
+            return fb_bn
+        fb["recommendation"] = (
+            f"**TinyLlama output was unavailable ({reason}). A reliable fallback response is shown below.**\n\n"
+            + fb["recommendation"]
+        )
+        return fb
 
     try:
-        messages, priming = _build_tinyllama_messages(prompt, profile, "English")
-        generated_text = _run_inference(messages, priming, temperature=0.55, top_p=0.9)
-        parsed = _parse_tinyllama_output(generated_text, language)
+        # ── First pass ──
+        msgs1, prime1 = _build_messages(profile, task_type)
+        raw1 = _infer(msgs1, prime1, temperature=0.55, top_p=0.90)
+        parsed1 = _parse(raw1)
 
-        if _is_low_quality_tinyllama_output(generated_text, parsed):
-            repair_messages, repair_priming = _build_tinyllama_repair_messages(prompt, profile, "English")
-            repaired_text = _run_inference(repair_messages, repair_priming, temperature=0.35, top_p=0.85)
-            repaired_parsed = _parse_tinyllama_output(repaired_text, language)
+        if not _is_poor(raw1, parsed1):
+            final = parsed1
+        else:
+            # ── Repair pass ──
+            msgs2, prime2 = _build_repair_messages(profile, task_type)
+            raw2 = _infer(msgs2, prime2, temperature=0.35, top_p=0.85)
+            parsed2 = _parse(raw2)
 
-            if not _is_low_quality_tinyllama_output(repaired_text, repaired_parsed):
-                parsed = repaired_parsed
+            if not _is_poor(raw2, parsed2):
+                final = parsed2
             else:
-                fallback = _generate_mock_response(profile, task_type, language)
-                fallback["recommendation"] = (
-                    "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
-                    "The live model output on this run was incomplete or low quality, so a stable fallback response is shown below.\n\n"
-                    + fallback["recommendation"]
-                )
-                return fallback
+                return _fallback("low quality after repair")
 
-        parsed["recommendation"] = (
+        # ── Attach model credit ──
+        final["recommendation"] = (
             "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
-            + parsed["recommendation"]
+            + final["recommendation"]
         )
 
-
+        # ── Translate if Bangla ──
         if language == "Bangla":
-            full_text = (
-                parsed.get("recommendation", "")
-                + " "
-                + " ".join(parsed.get("action_steps", []))
-                + " "
-                + parsed.get("explanation", "")
+            # Strip the credit line before translation, then re-add in Bangla
+            rec_body = final["recommendation"].replace(
+                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n", ""
+            )
+            final["recommendation"] = rec_body
+            final = _translate_result_to_bangla(final)
+            final["recommendation"] = (
+                "**নির্বাচিত মডেল ব্যবহার করে তৈরি: TinyLlama-1.1B-Chat**\n\n"
+                + final["recommendation"]
             )
 
-            if not re.search(r"[\u0980-\u09FF]{10,}", full_text):
-                label = "**Generated using selected backend model: TinyLlama-1.1B-Chat**"
-                bare_result = {
-                    "recommendation": parsed.get("recommendation", "").replace(label, "").strip(),
-                    "action_steps": parsed.get("action_steps", []),
-                    "explanation": parsed.get("explanation", ""),
-                    "disclaimer": parsed.get("disclaimer", ""),
-                }
+        return final
 
-                translated = _translate_result_to_bangla(bare_result)
-                translated["recommendation"] = label + "\n\n" + translated.get("recommendation", "")
-                parsed = translated
-
-
-        return parsed
-
-    except Exception as e:
-
-        fallback = _generate_mock_response(profile, task_type, language)
-
-        if language == "Bangla":
-            fallback_prefix = (
-                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
-                "এই রানে লাইভ মডেলের আউটপুট অসম্পূর্ণ বা নিম্নমানের ছিল, তাই নিচে একটি স্থিতিশীল বিকল্প উত্তর দেখানো হলো।\n\n"
-            )
-        else:
-            fallback_prefix = (
-                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
-                "The live model output on this run was incomplete or low quality, so a stable fallback response is shown below.\n\n"
-            )
-
-        fallback["recommendation"] = fallback_prefix + fallback["recommendation"]
-        return fallback
+    except Exception as exc:
+        return _fallback(str(exc))
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# ── Public API ──
 # ---------------------------------------------------------------------------
 
 def generate_financial_response(
@@ -922,34 +848,28 @@ def generate_financial_response(
     language: str = "English",
 ) -> dict:
     """
-    Main entry point for generating a financial recommendation.
+    Main entry point for the Smart Personal Finance Assistant LLM backend.
 
     Args:
-        profile: The structured user financial profile dictionary.
-        prompt: Structured prompt dict from prompt_templates.build_structured_prompt().
-        mode: "Mock Mode" or "TinyLlama (Selected Model)".
-        language: User selected language.
+        profile:  User financial profile dict.
+        prompt:   Structured prompt dict from prompt_templates.build_structured_prompt().
+        mode:     "Mock Mode" or "TinyLlama (Selected Model)".
+        language: "English" or "Bangla".
 
     Returns:
-        A dict with keys: recommendation, action_steps, explanation, disclaimer.
+        dict with keys: recommendation, action_steps, explanation, disclaimer
+        or dict with key: error
     """
     try:
+        task_type = _s(prompt.get("task_type", "Budget Planning"))
+
         if mode == "Mock Mode":
-            return _generate_mock_response(
-                profile,
-                prompt.get("task_type", "Budget Planning"),
-                language,
-            )
+            return _generate_mock_response(profile, task_type, language)
 
         if mode == "TinyLlama (Selected Model)":
-            return _generate_selected_model_response(profile, prompt, language)
+            return _generate_tinyllama(profile, prompt, language)
 
-        return {
-            "error": (
-                f"Unknown mode: '{mode}'. Choose 'Mock Mode' or "
-                "'TinyLlama (Selected Model)'."
-            )
-        }
+        return {"error": f"Unknown mode '{mode}'. Use 'Mock Mode' or 'TinyLlama (Selected Model)'."}
 
-    except Exception as e:
-        return {"error": f"Unexpected error in LLM backend: {str(e)}"}
+    except Exception as exc:
+        return {"error": f"Unexpected error in LLM backend: {exc}"}
