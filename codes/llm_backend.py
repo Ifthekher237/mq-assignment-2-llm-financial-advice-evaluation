@@ -18,6 +18,15 @@ from utils import (
     compute_debt_to_income_ratio,
 )
 
+
+
+try:
+    from googletrans import Translator
+    GOOGLETRANS_AVAILABLE = True
+except Exception:
+    Translator = None
+    GOOGLETRANS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Optional TinyLlama dependencies
 # ---------------------------------------------------------------------------
@@ -94,6 +103,45 @@ def _ensure_disclaimer_text(language: str) -> str:
         "This information is for educational purposes only and is not personalised financial advice. "
         "Please consult a registered financial adviser before making financial decisions."
     )
+
+
+
+def _translate_result_to_bangla(result: dict) -> dict:
+    """
+    Translate a structured English result dict into Bangla.
+    Falls back safely if translation is unavailable.
+    """
+    if not GOOGLETRANS_AVAILABLE:
+        return _build_bangla_mock_wrapper(result)
+
+    try:
+        translator = Translator()
+        translated = dict(result)
+
+        translated["recommendation"] = translator.translate(
+            result.get("recommendation", ""), dest="bn"
+        ).text
+
+        translated["action_steps"] = [
+            translator.translate(step, dest="bn").text
+            for step in result.get("action_steps", [])
+            if isinstance(step, str) and step.strip()
+        ]
+
+        translated["explanation"] = translator.translate(
+            result.get("explanation", ""), dest="bn"
+        ).text
+
+        translated["disclaimer"] = translator.translate(
+            result.get("disclaimer", ""), dest="bn"
+        ).text
+
+        return translated
+
+    except Exception:
+        return _build_bangla_mock_wrapper(result)
+
+
 
 
 def _build_bangla_mock_wrapper(result: dict) -> dict:
@@ -818,19 +866,22 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
             + parsed["recommendation"]
         )
 
-        if language == "Bangla" and not re.search(r"[\u0980-\u09FF]", parsed["recommendation"]):
-            parsed["recommendation"] = (
-                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
-                "বাংলা উত্তর তৈরির চেষ্টা করা হয়েছে। নিচে ব্যবহারযোগ্য আর্থিক পরামর্শ দেওয়া হলো:\n\n"
-                + _safe_text(parsed["recommendation"]).replace(
-                    "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n", ""
-                )
-            )
-            if not re.search(r"[\u0980-\u09FF]", parsed["explanation"]):
-                parsed["explanation"] = (
-                    "এই ব্যাখ্যাটি আপনার আর্থিক তথ্যের ভিত্তিতে তৈরি করা হয়েছে। " + parsed["explanation"]
-                )
-            parsed["disclaimer"] = _ensure_disclaimer_text("Bangla")
+        if language == "Bangla":
+            # If the model output is not genuinely Bangla, translate the full structured result.
+            rec_text = _safe_text(parsed.get("recommendation", ""))
+            if not re.search(r"[\u0980-\u09FF]", rec_text):
+                label = "**Generated using selected backend model: TinyLlama-1.1B-Chat**"
+                bare_result = {
+                    "recommendation": rec_text.replace(label, "").strip(),
+                    "action_steps": parsed.get("action_steps", []),
+                    "explanation": parsed.get("explanation", ""),
+                    "disclaimer": parsed.get("disclaimer", ""),
+                }
+
+                translated = _translate_result_to_bangla(bare_result)
+                translated["recommendation"] = label + "\n\n" + translated.get("recommendation", "")
+                parsed = translated
+
 
         return parsed
 
