@@ -841,12 +841,12 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
         return _clean_generated_text(priming + raw_completion)
 
     try:
-        messages, priming = _build_tinyllama_messages(prompt, profile, language)
+        messages, priming = _build_tinyllama_messages(prompt, profile, "English")
         generated_text = _run_inference(messages, priming, temperature=0.55, top_p=0.9)
         parsed = _parse_tinyllama_output(generated_text, language)
 
         if _is_low_quality_tinyllama_output(generated_text, parsed):
-            repair_messages, repair_priming = _build_tinyllama_repair_messages(prompt, profile, language)
+            repair_messages, repair_priming = _build_tinyllama_repair_messages(prompt, profile, "English")
             repaired_text = _run_inference(repair_messages, repair_priming, temperature=0.35, top_p=0.85)
             repaired_parsed = _parse_tinyllama_output(repaired_text, language)
 
