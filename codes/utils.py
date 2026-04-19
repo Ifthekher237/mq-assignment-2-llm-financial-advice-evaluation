@@ -65,8 +65,8 @@ def validate_profile(profile: dict) -> list:
     age      = safe_int(profile.get("age", 0))
     goal     = str(profile.get("financial_goal", "")).strip()
 
-    if income <= 0:
-        errors.append("Monthly income must be greater than zero.")
+    if income < 0:
+        errors.append("Monthly income cannot be negative.")
     if expenses < 0:
         errors.append("Monthly expenses cannot be negative.")
     if savings < 0:

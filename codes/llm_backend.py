@@ -8,7 +8,7 @@ Supports two modes:
 Main entry point: generate_financial_response(profile, prompt, mode, language)
 """
 
-import re  # moved to top-level imports
+import re
 
 from utils import (
     safe_float,
@@ -42,10 +42,83 @@ _TOKENIZER = None
 _MODEL = None
 _MODEL_LOAD_ERROR = None
 
+
+# ---------------------------------------------------------------------------
+# Small internal helpers
+# ---------------------------------------------------------------------------
+
+def _safe_text(value, default: str = "") -> str:
+    """Return a clean string without raising exceptions."""
+    try:
+        text = str(value).strip()
+        return text if text else default
+    except Exception:
+        return default
+
+
+def _format_amount(value) -> str:
+    """Format numeric values for prompt injection."""
+    try:
+        return f"${float(value):,.0f}"
+    except Exception:
+        return "$0"
+
+
+def _clean_generated_text(text: str) -> str:
+    """Remove common junk that small models often echo back."""
+    if not text:
+        return ""
+
+    cleaned = text.replace("<|assistant|>", " ").replace("<|user|>", " ").replace("<|system|>", " ")
+    cleaned = re.sub(r"\[[^\]]{1,80}\]", "", cleaned)
+    cleaned = re.sub(r"\{[^\}]{1,80}\}", "", cleaned)
+    cleaned = re.sub(r"(?i)^instructions:\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"(?i)use this exact output structure:.*", "", cleaned)
+    cleaned = re.sub(r"(?i)do not use placeholders.*", "", cleaned)
+    cleaned = re.sub(r"(?i)do not repeat the profile.*", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _strip_label(line: str) -> str:
+    return re.sub(r"^[\-\•\*\d\.\)\s]+", "", line).strip()
+
+
+def _ensure_disclaimer_text(language: str) -> str:
+    if language == "Bangla":
+        return (
+            "এই তথ্য কেবল শিক্ষামূলক উদ্দেশ্যে দেওয়া হয়েছে। ব্যক্তিগত আর্থিক সিদ্ধান্ত নেওয়ার আগে "
+            "একজন নিবন্ধিত আর্থিক উপদেষ্টার সঙ্গে পরামর্শ করুন।"
+        )
+    return (
+        "This information is for educational purposes only and is not personalised financial advice. "
+        "Please consult a registered financial adviser before making financial decisions."
+    )
+
+
+def _build_bangla_mock_wrapper(result: dict) -> dict:
+    """Add a Bangla-oriented wrapper without relying on external translation."""
+    wrapped = dict(result)
+    wrapped["recommendation"] = (
+        "**বাংলা মোড নোট:** সম্পূর্ণ বাংলা উত্তর সবসময় স্থিতিশীল নাও হতে পারে। নিচে ব্যবহারযোগ্য আর্থিক পরামর্শ দেওয়া হলো.\n\n"
+        + wrapped.get("recommendation", "")
+    )
+    wrapped["explanation"] = (
+        "এই ব্যাখ্যাটি আপনার আয়, ব্যয়, সঞ্চয়, ঋণ, লক্ষ্য এবং ঝুঁকি সহনশীলতার ভিত্তিতে তৈরি করা হয়েছে। "
+        + wrapped.get("explanation", "")
+    )
+    wrapped["disclaimer"] = _ensure_disclaimer_text("Bangla")
+    return wrapped
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
 def _load_selected_model():
     """
     Lazily load TinyLlama only when needed.
-    This avoids slowing down Mock Mode and keeps the app stable.
+    Prefers GPU when available and remains safe on CPU-only systems.
     """
     global _TOKENIZER, _MODEL, _MODEL_LOAD_ERROR
 
@@ -66,16 +139,24 @@ def _load_selected_model():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
 
-        _TOKENIZER = AutoTokenizer.from_pretrained(SELECTED_MODEL)
-        _MODEL = AutoModelForCausalLM.from_pretrained(
-            SELECTED_MODEL,
-            torch_dtype=dtype,
-        )
+        _TOKENIZER = AutoTokenizer.from_pretrained(SELECTED_MODEL, use_fast=True)
+        if _TOKENIZER.pad_token is None:
+            _TOKENIZER.pad_token = _TOKENIZER.eos_token
+        _TOKENIZER.padding_side = "left"
 
-        _MODEL = _MODEL.to(device)
+        model_kwargs = {"torch_dtype": dtype}
+        if device == "cuda":
+            model_kwargs["device_map"] = "auto"
+            model_kwargs["low_cpu_mem_usage"] = True
+
+        _MODEL = AutoModelForCausalLM.from_pretrained(SELECTED_MODEL, **model_kwargs)
+
+        if device != "cuda":
+            _MODEL = _MODEL.to(device)
+
         _MODEL.eval()
 
-        if _TOKENIZER.chat_template is None:
+        if getattr(_TOKENIZER, "chat_template", None) is None:
             _TOKENIZER.chat_template = (
                 "{% for message in messages %}"
                 "{% if message['role'] == 'system' %}<|system|>\n{{ message['content'] }}\n{% endif %}"
@@ -89,6 +170,7 @@ def _load_selected_model():
     except Exception as e:
         _MODEL_LOAD_ERROR = f"Failed to load {SELECTED_MODEL}: {str(e)}"
         raise RuntimeError(_MODEL_LOAD_ERROR)
+
 
 # ---------------------------------------------------------------------------
 # Mock Mode — Task-specific response generators
@@ -259,6 +341,7 @@ def _debt_management_mock(profile: dict) -> dict:
             "Avoid taking on any new debt while paying down existing obligations.",
             "Once debt-free, redirect the repayment amount into savings or investments.",
         ]
+
         if urgency == "high":
             extra = "it minimises total interest paid over time."
         elif urgency == "moderate":
@@ -358,77 +441,66 @@ def _generate_mock_response(profile: dict, task_type: str, language: str) -> dic
         "Debt Management": _debt_management_mock,
         "Beginner Investment Guidance": _investment_guidance_mock,
     }
-    result = generators.get(task_type, _budget_planning_mock)(profile)
 
+    result = generators.get(task_type, _budget_planning_mock)(profile)
     result["disclaimer"] = (
         "This recommendation is generated for educational purposes as part of COMP8420 Assignment 2. "
         "It is not personalised financial advice. Please consult a registered financial adviser "
         "before making any financial decisions."
     )
+
     if language == "Bangla":
-        result["disclaimer"] += (
-            " | বিঃদ্রঃ বর্তমান সংস্করণে ইংরেজিতে পরামর্শ প্রদান করা হচ্ছে। "
-            "ভবিষ্যতে বাংলা ভাষায় সম্পূর্ণ সমর্থন যোগ করা হবে।"
-        )
+        result = _build_bangla_mock_wrapper(result)
 
     return result
+
 
 # ---------------------------------------------------------------------------
 # TinyLlama — Prompt builders
 # ---------------------------------------------------------------------------
-# CHANGED: _build_tinyllama_messages now accepts `profile` to inject real
-# user values directly into the prompt, and returns a (messages, priming)
-# tuple. The priming string is appended after apply_chat_template so the
-# model's first generated token continues a real sentence rather than a
-# format header, dramatically reducing placeholder and echo output.
-# ---------------------------------------------------------------------------
 
 def _build_tinyllama_messages(prompt: dict, profile: dict, language: str) -> tuple:
     """
-    Build chat messages and a priming prefix for TinyLlama inference.
-
-    Returns:
-        (messages, priming) where `priming` is appended to the
-        apply_chat_template output before tokenisation to force the model
-        to start generating real content rather than template skeletons.
+    Build concise, task-specific chat messages and a priming prefix for TinyLlama.
+    The prompt is intentionally short to reduce instruction echoing.
     """
-    income     = safe_float(profile.get("monthly_income", 0))
-    expenses   = safe_float(profile.get("monthly_expenses", 0))
-    savings    = safe_float(profile.get("current_savings", 0))
-    debt       = safe_float(profile.get("current_debt", 0))
-    surplus    = compute_surplus(income, expenses)
-    age        = int(safe_float(profile.get("age", 25)))
-    risk       = profile.get("risk_tolerance", "Medium")
-    goal       = profile.get("financial_goal", "improve my finances")
-    horizon    = profile.get("investment_horizon", "Medium (2-5 years)")
-    task       = prompt.get("task_type", "Budget Planning")
-    employment = profile.get("employment_status", "employed")
-
-    system_prompt = (
-        "You are a financial advisor assistant. "
-        "Your only job is to write complete financial advice using ONLY the real numbers "
-        "from the user profile below. "
-        "CRITICAL RULES — violating any of these makes your answer wrong: "
-        "1. NEVER write placeholder text such as [Name], [Age], [Amount], [Employment Status], "
-        "or ANY text inside square brackets. "
-        "2. NEVER copy or repeat the user profile or these instructions. "
-        "3. NEVER leave a section heading without real content underneath it. "
-        "4. Write full sentences with specific dollar amounts from the profile. "
-        "5. If you do not know a specific value, use the numbers provided — do not invent placeholders."
-    )
+    income = safe_float(profile.get("monthly_income", 0))
+    expenses = safe_float(profile.get("monthly_expenses", 0))
+    savings = safe_float(profile.get("current_savings", 0))
+    debt = safe_float(profile.get("current_debt", 0))
+    surplus = compute_surplus(income, expenses)
+    age = int(safe_float(profile.get("age", 25)))
+    risk = _safe_text(profile.get("risk_tolerance", "Medium"), "Medium")
+    goal = _safe_text(profile.get("financial_goal", "improve finances"), "improve finances")
+    horizon = _safe_text(profile.get("investment_horizon", "Medium (2-5 years)"), "Medium (2-5 years)")
+    employment = _safe_text(profile.get("employment_status", "Not stated"), "Not stated")
+    extras = _safe_text(profile.get("extra_preferences", "None stated"), "None stated")
+    task = _safe_text(prompt.get("task_type", "Budget Planning"), "Budget Planning")
 
     if language == "Bangla":
-        system_prompt += " Respond in Bangla where possible."
+        language_instruction = (
+            "Write the answer mostly in simple Bangla. Keep the section labels in English exactly as given. "
+            "You may keep financial terms like budget, savings, debt, ETF, or risk in English if needed."
+        )
+    else:
+        language_instruction = "Write the answer in clear English."
+
+    system_prompt = (
+        "You are a practical finance assistant. Use only the profile facts provided. "
+        "Do not copy the prompt. Do not repeat the profile line by line. "
+        "Do not use placeholders or square brackets. "
+        "Write all four sections with real content. "
+        "Make the advice specific, short, and useful."
+    )
 
     user_content = (
-        f"Provide {task} advice for this person:\n"
-        f"- Age: {age}, Employment: {employment}\n"
-        f"- Monthly income: ${income:,.0f}, Monthly expenses: ${expenses:,.0f}\n"
-        f"- Monthly surplus: ${surplus:,.0f}\n"
-        f"- Current savings: ${savings:,.0f}, Current debt: ${debt:,.0f}\n"
-        f"- Financial goal: {goal}\n"
-        f"- Risk tolerance: {risk}, Investment horizon: {horizon}\n\n"
-        "Respond using exactly these four labelled sections:\n"
+        f"Task: {task}\n"
+        f"Profile: age {age}; employment {employment}; income {_format_amount(income)}/month; "
+        f"expenses {_format_amount(expenses)}/month; surplus {_format_amount(surplus)}/month; "
+        f"savings {_format_amount(savings)}; debt {_format_amount(debt)}; risk {risk}; "
+        f"goal {goal}; horizon {horizon}; extra preferences {extras}.\n"
+        f"{language_instruction}\n"
+        "Give practical personal finance advice with exactly these sections:\n"
         "RECOMMENDATION:\n"
         "ACTION STEPS:\n"
         "1.\n2.\n3.\n4.\n"
@@ -438,52 +510,55 @@ def _build_tinyllama_messages(prompt: dict, profile: dict, language: str) -> tup
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_content},
+        {"role": "user", "content": user_content},
     ]
-    # Priming: append "RECOMMENDATION:" after the assistant header so the
-    # model's very first token continues real advice, not a template echo.
-    priming = "RECOMMENDATION:"
+
+    priming = "RECOMMENDATION: Based on your current finances, "
     return messages, priming
 
 
-# CHANGED: new repair-pass prompt builder — called only when first pass
-# is detected as low quality.  Uses stronger priming that seeds the
-# RECOMMENDATION sentence with actual numbers, making it far harder for
-# the model to backslide into placeholders.
 def _build_tinyllama_repair_messages(prompt: dict, profile: dict, language: str) -> tuple:
     """
-    Stricter prompt for the repair pass after a low-quality first generation.
-    The priming string seeds the RECOMMENDATION sentence with real numbers
-    so the model must continue with real content.
+    Build a stricter repair prompt after a low-quality first pass.
+    This prompt tells the model to rewrite the answer fully and correctly.
     """
-    income     = safe_float(profile.get("monthly_income", 0))
-    expenses   = safe_float(profile.get("monthly_expenses", 0))
-    savings    = safe_float(profile.get("current_savings", 0))
-    debt       = safe_float(profile.get("current_debt", 0))
-    surplus    = compute_surplus(income, expenses)
-    age        = int(safe_float(profile.get("age", 25)))
-    risk       = profile.get("risk_tolerance", "Medium")
-    goal       = profile.get("financial_goal", "improve my finances")
-    horizon    = profile.get("investment_horizon", "Medium (2-5 years)")
-    task       = prompt.get("task_type", "Budget Planning")
-    employment = profile.get("employment_status", "employed")
-
-    system_prompt = (
-        "You are a financial advisor. Write practical, complete financial advice. "
-        "Use ONLY real values from the profile. "
-        "No placeholders. No square brackets. No repeated instructions. "
-        "Every section must contain full sentences with specific dollar amounts."
-    )
+    income = safe_float(profile.get("monthly_income", 0))
+    expenses = safe_float(profile.get("monthly_expenses", 0))
+    savings = safe_float(profile.get("current_savings", 0))
+    debt = safe_float(profile.get("current_debt", 0))
+    surplus = compute_surplus(income, expenses)
+    age = int(safe_float(profile.get("age", 25)))
+    risk = _safe_text(profile.get("risk_tolerance", "Medium"), "Medium")
+    goal = _safe_text(profile.get("financial_goal", "improve finances"), "improve finances")
+    horizon = _safe_text(profile.get("investment_horizon", "Medium (2-5 years)"), "Medium (2-5 years)")
+    employment = _safe_text(profile.get("employment_status", "Not stated"), "Not stated")
+    extras = _safe_text(profile.get("extra_preferences", "None stated"), "None stated")
+    task = _safe_text(prompt.get("task_type", "Budget Planning"), "Budget Planning")
 
     if language == "Bangla":
-        system_prompt += " Respond in Bangla where possible."
+        language_instruction = (
+            "Rewrite the full answer mostly in simple Bangla. Keep section labels in English. "
+            "Do not switch back to English except for short finance terms when necessary."
+        )
+    else:
+        language_instruction = "Rewrite the full answer in clear English."
+
+    system_prompt = (
+        "The previous answer was low quality. Rewrite it fully. "
+        "Use only the profile facts below. "
+        "No placeholders. No copied instructions. No empty headings. "
+        "Recommendation must be specific. Action steps must be useful. "
+        "Explanation and disclaimer must be complete."
+    )
 
     user_content = (
-        f"Write {task} advice for: {age}-year-old {employment}, "
-        f"income ${income:,.0f}/month, expenses ${expenses:,.0f}/month, "
-        f"surplus ${surplus:,.0f}/month, savings ${savings:,.0f}, debt ${debt:,.0f}, "
-        f"goal: {goal}, risk: {risk}, horizon: {horizon}.\n\n"
-        "Complete all four sections with real sentences — no placeholders:\n"
+        f"Rewrite {task} advice for this profile:\n"
+        f"age {age}; employment {employment}; income {_format_amount(income)}/month; "
+        f"expenses {_format_amount(expenses)}/month; surplus {_format_amount(surplus)}/month; "
+        f"savings {_format_amount(savings)}; debt {_format_amount(debt)}; risk {risk}; "
+        f"goal {goal}; horizon {horizon}; extra preferences {extras}.\n"
+        f"{language_instruction}\n"
+        "Return all four sections only:\n"
         "RECOMMENDATION:\n"
         "ACTION STEPS:\n"
         "1.\n2.\n3.\n4.\n"
@@ -493,236 +568,197 @@ def _build_tinyllama_repair_messages(prompt: dict, profile: dict, language: str)
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_content},
+        {"role": "user", "content": user_content},
     ]
-    # Stronger priming: seed the first sentence of RECOMMENDATION with
-    # actual numbers so the model cannot default to placeholder text.
-    priming = (
-        f"RECOMMENDATION: Given your monthly income of ${income:,.0f} and expenses of "
-        f"${expenses:,.0f}, your monthly surplus is ${surplus:,.0f}."
-    )
+
+    if language == "Bangla":
+        priming = (
+            f"RECOMMENDATION: আপনার মাসিক আয় {_format_amount(income)} এবং ব্যয় {_format_amount(expenses)} হওয়ায় "
+        )
+    else:
+        priming = (
+            f"RECOMMENDATION: Given your monthly income of {_format_amount(income)} and expenses of {_format_amount(expenses)}, "
+        )
+
     return messages, priming
 
-# ---------------------------------------------------------------------------
-# TinyLlama — Quality checker
-# ---------------------------------------------------------------------------
-# CHANGED: new helper — detects low-quality or template-like TinyLlama
-# output so the repair loop knows when to intervene.
-# ---------------------------------------------------------------------------
-
-def _is_low_quality_tinyllama_output(raw_text: str, parsed: dict) -> bool:
-    """
-    Return True if the output is considered too low quality to show the user.
-
-    Checks for:
-    - Placeholder / square-bracket text
-    - Echoed instruction fragments from the prompt
-    - Too-short recommendation (< 15 words)
-    - Fewer than 3 action steps
-    - Missing or too-short explanation (< 8 words)
-    - Overall response too short (< 60 words total)
-    """
-    text_lower = raw_text.lower()
-
-    # 1. Placeholder patterns (square-bracket templates)
-    placeholder_patterns = [
-        r'\[your name\]', r'\[age\]', r'\[employment',  r'\[amount',
-        r'\[your ',       r'\[insert', r'\[write ',      r'\[step ',
-        r'\[specific',    r'\[number', r'\[goal\]',      r'\[risk',
-        r'\[income',      r'\[debt\]', r'\[savings',     r'\[horizon',
-    ]
-    for pat in placeholder_patterns:
-        if re.search(pat, text_lower):
-            return True
-
-    # 2. Echoed instruction fragments
-    echo_phrases = [
-        'write 2-4',          'write a specific',  'write 2 to',
-        'write full sentence', '2-4 sentences',     'using this exact format',
-        'using exactly these', 'complete all four', 'no placeholders:\n',
-        'respond using exactly', 'four labelled',
-    ]
-    for phrase in echo_phrases:
-        if phrase in text_lower:
-            return True
-
-    # 3. Too-short recommendation
-    rec = parsed.get("recommendation", "")
-    if len(rec.split()) < 15:
-        return True
-
-    # 4. Fewer than 3 action steps
-    steps = parsed.get("action_steps", [])
-    if len(steps) < 3:
-        return True
-
-    # 5. Missing / trivially short explanation
-    exp = parsed.get("explanation", "")
-    if len(exp.split()) < 8:
-        return True
-
-    # 6. Response far too short overall
-    if len(raw_text.split()) < 60:
-        return True
-
-    return False
 
 # ---------------------------------------------------------------------------
 # TinyLlama — Output parser
 # ---------------------------------------------------------------------------
-# CHANGED: parser is now more robust:
-# - strips placeholder text and echoed instructions before extraction
-# - uses flexible section-header regex (colon optional, case-insensitive)
-# - trims recommendation if it bleeds into numbered lists without a header
-# - skips trivially short action step items (< 3 words)
-# - uses paragraph-level fallback for recommendation if regex fails
-# ---------------------------------------------------------------------------
 
-def _parse_tinyllama_output(text: str) -> dict:
+def _parse_tinyllama_output(text: str, language: str = "English") -> dict:
     """
     Parse raw TinyLlama output into structured sections.
-
-    Attempts RECOMMENDATION / ACTION STEPS / EXPLANATION / DISCLAIMER
-    extraction with flexible regex, then falls back to heuristic recovery.
+    Handles imperfect formatting and recovers useful content where possible.
     """
-    text = text.strip()
-
-    # ── 1. Remove square-bracket placeholders ────────────────────────────────
-    text = re.sub(r'\[[^\]]{2,60}\]', '', text)
-
-    # ── 2. Remove echoed instruction fragments ────────────────────────────────
-    echo_patterns = [
-        r'Write \d[–\-]\d (full )?sentences?[^\n]*\n?',
-        r'Write a specific [^\n]*\n?',
-        r'using this exact format[^\n]*\n?',
-        r'\(2[–\-]4 sentences\)[^\n]*',
-        r'\(2 sentences\)[^\n]*',
-    ]
-    for pat in echo_patterns:
-        text = re.sub(pat, '', text, flags=re.IGNORECASE)
-
-    text = text.strip()
+    text = _clean_generated_text(_safe_text(text))
 
     recommendation = ""
-    action_steps   = []
-    explanation    = ""
-    disclaimer     = ""
+    action_steps = []
+    explanation = ""
+    disclaimer = ""
 
-    # ── 3. Section extraction (flexible: colon optional, case-insensitive) ───
-    rec_match = re.search(
-        r'RECOMMENDATION:?\s*(.*?)(?=\n\s*ACTION STEPS:?|\Z)',
-        text, flags=re.IGNORECASE | re.DOTALL,
-    )
-    act_match = re.search(
-        r'ACTION STEPS:?\s*(.*?)(?=\n\s*EXPLANATION:?|\Z)',
-        text, flags=re.IGNORECASE | re.DOTALL,
-    )
-    exp_match = re.search(
-        r'EXPLANATION:?\s*(.*?)(?=\n\s*DISCLAIMER:?|\Z)',
-        text, flags=re.IGNORECASE | re.DOTALL,
-    )
-    dis_match = re.search(
-        r'DISCLAIMER:?\s*(.+?)(?:\n\n|\Z)',
-        text, flags=re.IGNORECASE | re.DOTALL,
+    section_pattern = re.compile(
+        r"(?is)(RECOMMENDATION|ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:?\s*"
+        r"(.*?)(?=(?:\n\s*(?:RECOMMENDATION|ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:)|\Z)"
     )
 
-    if rec_match:
-        recommendation = rec_match.group(1).strip()
-        # Trim if it bleeds into a numbered list without a section header
-        recommendation = re.split(r'\n\s*1[\.\)]', recommendation)[0].strip()
+    sections = {}
+    for label, content in section_pattern.findall(text):
+        sections[label.upper().replace(" ", "_")] = content.strip()
 
-    if act_match:
-        action_block = act_match.group(1).strip()
+    recommendation = sections.get("RECOMMENDATION", "")
+    action_block = sections.get("ACTION_STEPS", "")
+    explanation = sections.get("EXPLANATION", "")
+    disclaimer = sections.get("DISCLAIMER", "")
+
+    if action_block:
         for line in action_block.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            cleaned = re.sub(r'^[\-\•\*\d\.\)\s]+', '', stripped).strip()
-            # Only keep items that are actual sentences (>= 3 words)
-            if cleaned and len(cleaned.split()) >= 3:
-                action_steps.append(cleaned)
+            line = _strip_label(line)
+            if line and len(line.split()) >= 3 and "recommendation" not in line.lower():
+                action_steps.append(line)
 
-    if exp_match:
-        explanation = exp_match.group(1).strip()
-
-    if dis_match:
-        disclaimer = dis_match.group(1).strip()
-
-    # ── 4. Robust fallbacks ───────────────────────────────────────────────────
-
-    # Recommendation fallback: use first meaningful paragraph
-    if not recommendation or len(recommendation.split()) < 12:
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        for para in paragraphs:
-            if (
-                len(para.split()) >= 15
-                and not para.upper().startswith('ACTION')
-                and not para.upper().startswith('EXPLANATION')
-                and not para.upper().startswith('DISCLAIMER')
-            ):
-                recommendation = para[:600]
-                break
-        if not recommendation:
-            recommendation = text[:600].strip()
-
-    # Action steps fallback: scan full text for numbered lines
     if not action_steps:
         for line in text.splitlines():
             stripped = line.strip()
-            if re.match(r'^\d+[\.\)]\s+\S', stripped):
-                cleaned = re.sub(r'^\d+[\.\)]\s+', '', stripped).strip()
+            if re.match(r"^\d+[\.\)]\s+", stripped):
+                cleaned = _strip_label(stripped)
                 if cleaned and len(cleaned.split()) >= 3:
                     action_steps.append(cleaned)
 
-    # Explanation fallback
+    if not recommendation or len(recommendation.split()) < 12:
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        for para in paragraphs:
+            upper = para.upper()
+            if not upper.startswith("ACTION") and not upper.startswith("EXPLANATION") and not upper.startswith("DISCLAIMER"):
+                if len(para.split()) >= 12:
+                    recommendation = para
+                    break
+
+    if recommendation:
+        recommendation = re.split(r"\n\s*(?:ACTION\s*STEPS|EXPLANATION|DISCLAIMER)\s*:?", recommendation)[0].strip()
+
     if not explanation or len(explanation.split()) < 8:
+        for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
+            upper = para.upper()
+            if "because" in para.lower() or "based on" in para.lower() or "কারণ" in para:
+                if not upper.startswith("RECOMMENDATION") and not upper.startswith("ACTION"):
+                    explanation = para
+                    break
+
+    if not disclaimer:
+        for para in [p.strip() for p in text.split("\n\n") if p.strip()]:
+            low = para.lower()
+            if "educational" in low or "financial advice" in low or "উপদেষ্টা" in para or "শিক্ষামূলক" in para:
+                disclaimer = para
+                break
+
+    recommendation = recommendation.strip()
+    explanation = explanation.strip()
+    disclaimer = disclaimer.strip()
+
+    if len(action_steps) > 6:
+        action_steps = action_steps[:6]
+
+    if not explanation:
         explanation = (
-            "This advice was generated using TinyLlama based on the user's income, "
-            "expenses, debt, savings, financial goal, investment horizon, and risk tolerance."
+            "This advice is based on the user's income, expenses, debt, savings, financial goal, "
+            "investment horizon, and risk tolerance."
+            if language != "Bangla"
+            else "এই পরামর্শটি ব্যবহারকারীর আয়, ব্যয়, ঋণ, সঞ্চয়, লক্ষ্য, সময়সীমা এবং ঝুঁকি সহনশীলতার ভিত্তিতে তৈরি।"
         )
 
-    # Disclaimer fallback
     if not disclaimer:
-        disclaimer = (
-            "This is educational information only and not personalised financial advice. "
-            "Please consult a registered financial adviser before making any financial decisions."
-        )
+        disclaimer = _ensure_disclaimer_text(language)
 
     return {
         "recommendation": recommendation,
-        "action_steps":   action_steps[:6],
-        "explanation":    explanation,
-        "disclaimer":     disclaimer,
+        "action_steps": action_steps,
+        "explanation": explanation,
+        "disclaimer": disclaimer,
     }
+
+
+# ---------------------------------------------------------------------------
+# TinyLlama — Quality checker
+# ---------------------------------------------------------------------------
+
+def _is_low_quality_tinyllama_output(raw_text: str, parsed: dict) -> bool:
+    """
+    Return True if output is too poor to show directly.
+
+    Balanced checks:
+    - rejects placeholders, instruction echoes, empty sections, and trivial outputs
+    - allows imperfect but usable answers to pass
+    """
+    text_lower = _safe_text(raw_text).lower()
+    recommendation = _safe_text(parsed.get("recommendation", ""))
+    explanation = _safe_text(parsed.get("explanation", ""))
+    disclaimer = _safe_text(parsed.get("disclaimer", ""))
+    action_steps = parsed.get("action_steps", [])
+
+    placeholder_patterns = [
+        r"\[[^\]]+\]",
+        r"\bplaceholder\b",
+        r"\byour name\b",
+        r"\binsert\b",
+        r"\bwrite 4\b",
+        r"\bwrite the answer\b",
+        r"\buse only the profile facts\b",
+        r"\breturn all four sections\b",
+        r"\bdo not copy the prompt\b",
+    ]
+    for pattern in placeholder_patterns:
+        if re.search(pattern, text_lower):
+            return True
+
+    if len(text_lower.split()) < 40:
+        return True
+
+    if len(recommendation.split()) < 8:
+        return True
+
+    useful_steps = [
+        step for step in action_steps
+        if isinstance(step, str) and len(step.split()) >= 4 and "action steps" not in step.lower()
+    ]
+    if len(useful_steps) < 2:
+        return True
+
+    if len(explanation.split()) < 6:
+        return True
+
+    if len(disclaimer.split()) < 6:
+        return True
+
+    heading_only_patterns = [
+        "recommendation:",
+        "action steps:",
+        "explanation:",
+        "disclaimer:",
+    ]
+    for heading in heading_only_patterns:
+        if text_lower.count(heading) >= 2 and len(text_lower.replace(heading, "").strip().split()) < 40:
+            return True
+
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Selected Model — Real TinyLlama inference with quality check + repair
 # ---------------------------------------------------------------------------
-# CHANGED: added repair loop.
-#   1. First-pass generation with primed prompt at temperature=0.5.
-#   2. _is_low_quality_tinyllama_output() checks the result.
-#   3. If low quality: one repair pass with stricter primed prompt at t=0.3.
-#   4. If repair also fails: honest mock fallback with academic explanation.
-# All other behaviour (lazy loading, CPU compat, exception fallback) is
-# preserved exactly as before.
-# ---------------------------------------------------------------------------
 
 def _generate_selected_model_response(profile: dict, prompt: dict, language: str) -> dict:
     """
-    Run real TinyLlama inference with an automatic repair pass on low-quality
-    output.  Falls back to a structured mock response only as a last resort,
-    with an academically honest explanation.
+    Run real TinyLlama inference with one repair pass.
+    Falls back to a structured mock response only as a last resort.
     """
     task_type = prompt.get("task_type", "Budget Planning")
 
-    # ── Shared inference helper ───────────────────────────────────────────────
-    def _run_inference(messages: list, priming: str,
-                       temperature: float, do_sample: bool) -> str:
-        """Tokenise, generate, and return the full response text."""
+    def _run_inference(messages: list, priming: str, temperature: float, top_p: float) -> str:
         tokenizer, model = _load_selected_model()
 
-        # Apply chat template then append priming so the model's first
-        # generated token continues real content, not a format header.
         formatted = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -742,84 +778,75 @@ def _generate_selected_model_response(profile: dict, prompt: dict, language: str
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=480,
+                max_new_tokens=380,
+                do_sample=True,
                 temperature=temperature,
-                do_sample=do_sample,
-                top_p=0.9,
-                repetition_penalty=1.2,
+                top_p=top_p,
+                repetition_penalty=1.15,
                 no_repeat_ngram_size=3,
+                eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.eos_token_id,
             )
 
         new_tokens = outputs[0][input_len:]
         raw_completion = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        return _clean_generated_text(priming + raw_completion)
 
-        # Reconstruct the full response including the primed prefix so the
-        # parser sees "RECOMMENDATION: ..." from the very first character.
-        return priming + " " + raw_completion
-
-    # ── Main inference flow ───────────────────────────────────────────────────
     try:
-        # ── First pass ────────────────────────────────────────────────────────
         messages, priming = _build_tinyllama_messages(prompt, profile, language)
-        generated_text = _run_inference(
-            messages, priming,
-            temperature=0.5, do_sample=True,
-        )
-        parsed = _parse_tinyllama_output(generated_text)
+        generated_text = _run_inference(messages, priming, temperature=0.55, top_p=0.9)
+        parsed = _parse_tinyllama_output(generated_text, language)
 
-        # ── Quality gate ──────────────────────────────────────────────────────
         if _is_low_quality_tinyllama_output(generated_text, parsed):
-
-            # ── Repair pass ───────────────────────────────────────────────────
-            repair_messages, repair_priming = _build_tinyllama_repair_messages(
-                prompt, profile, language
-            )
-            repaired_text = _run_inference(
-                repair_messages, repair_priming,
-                temperature=0.3, do_sample=True,
-            )
-            repaired_parsed = _parse_tinyllama_output(repaired_text)
+            repair_messages, repair_priming = _build_tinyllama_repair_messages(prompt, profile, language)
+            repaired_text = _run_inference(repair_messages, repair_priming, temperature=0.35, top_p=0.85)
+            repaired_parsed = _parse_tinyllama_output(repaired_text, language)
 
             if not _is_low_quality_tinyllama_output(repaired_text, repaired_parsed):
-                # Repair succeeded — use repaired output
                 parsed = repaired_parsed
             else:
-                # Both passes produced low-quality output — use mock fallback
-                # with an academically honest explanation rather than raw junk.
                 fallback = _generate_mock_response(profile, task_type, language)
                 fallback["recommendation"] = (
                     "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
-                    "*(Note: TinyLlama inference produced low-quality output on this run "
-                    "after both a primary and a repair generation pass. "
-                    "This is a documented limitation of small on-device LLMs (1.1B parameters) "
-                    "on CPU-only or memory-constrained hardware. "
-                    "A structured fallback response is shown below for demonstration purposes.)*\n\n"
+                    "The live model output on this run was incomplete or low quality, so a stable fallback response is shown below.\n\n"
                     + fallback["recommendation"]
                 )
                 return fallback
 
-        # ── Successful output — prepend model label ───────────────────────────
         parsed["recommendation"] = (
             "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
             + parsed["recommendation"]
         )
+
+        if language == "Bangla" and not re.search(r"[\u0980-\u09FF]", parsed["recommendation"]):
+            parsed["recommendation"] = (
+                "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n"
+                "বাংলা উত্তর তৈরির চেষ্টা করা হয়েছে। নিচে ব্যবহারযোগ্য আর্থিক পরামর্শ দেওয়া হলো:\n\n"
+                + _safe_text(parsed["recommendation"]).replace(
+                    "**Generated using selected backend model: TinyLlama-1.1B-Chat**\n\n", ""
+                )
+            )
+            if not re.search(r"[\u0980-\u09FF]", parsed["explanation"]):
+                parsed["explanation"] = (
+                    "এই ব্যাখ্যাটি আপনার আর্থিক তথ্যের ভিত্তিতে তৈরি করা হয়েছে। " + parsed["explanation"]
+                )
+            parsed["disclaimer"] = _ensure_disclaimer_text("Bangla")
+
         return parsed
 
     except Exception as e:
-        # Model load failure or runtime error — stable mock fallback.
         fallback = _generate_mock_response(profile, task_type, language)
         fallback["recommendation"] = (
-            "**TinyLlama inference was unavailable on this device, "
-            "so the app used a stable fallback response.**\n\n"
+            "**TinyLlama inference was unavailable on this device, so the app used a stable fallback response.**\n\n"
             + fallback["recommendation"]
         )
-        fallback["explanation"] += (
-            " TinyLlama was still selected as the preferred backend model based on "
-            "evaluation results, but local inference could not be completed here. "
-            f"Technical reason: {str(e)}"
+        fallback["explanation"] = (
+            fallback.get("explanation", "")
+            + " TinyLlama was selected as the preferred backend model based on comparative evaluation, "
+            + f"but live inference could not be completed on this run. Technical reason: {str(e)}"
         )
         return fallback
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -835,9 +862,9 @@ def generate_financial_response(
     Main entry point for generating a financial recommendation.
 
     Args:
-        profile:  The structured user financial profile dictionary.
-        prompt:   Structured prompt dict from prompt_templates.build_structured_prompt().
-        mode:     "Mock Mode" or "TinyLlama (Selected Model)".
+        profile: The structured user financial profile dictionary.
+        prompt: Structured prompt dict from prompt_templates.build_structured_prompt().
+        mode: "Mock Mode" or "TinyLlama (Selected Model)".
         language: User selected language.
 
     Returns:
@@ -850,14 +877,16 @@ def generate_financial_response(
                 prompt.get("task_type", "Budget Planning"),
                 language,
             )
-        elif mode == "TinyLlama (Selected Model)":
+
+        if mode == "TinyLlama (Selected Model)":
             return _generate_selected_model_response(profile, prompt, language)
-        else:
-            return {
-                "error": (
-                    f"Unknown mode: '{mode}'. Choose 'Mock Mode' or "
-                    "'TinyLlama (Selected Model)'."
-                )
-            }
+
+        return {
+            "error": (
+                f"Unknown mode: '{mode}'. Choose 'Mock Mode' or "
+                "'TinyLlama (Selected Model)'."
+            )
+        }
+
     except Exception as e:
         return {"error": f"Unexpected error in LLM backend: {str(e)}"}

@@ -1,169 +1,265 @@
 """
-app.py — Streamlit frontend for SmartFinance AI Assistant
-COMP8420 Assignment 2: Large Language Models
-Final submission version
+app.py — Streamlit frontend for the Smart Personal Finance Assistant
+COMP8420 Assignment 2 — Large Language Models
+
+Supports:
+- Mock Mode: stable rule-based personalised responses
+- TinyLlama (Selected Model): real open-source LLM inference
+- English and Bangla language output
 """
 
 import streamlit as st
-from dialogue_manager import run_financial_dialogue
-from utils import validate_profile, format_currency, compute_surplus, compute_savings_rate
+from dialogue_manager import DialogueManager
+from utils import safe_float
 
 # ---------------------------------------------------------------------------
-# Page Configuration
+# Page configuration
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="SmartFinance AI Assistant",
+    page_title="Smart Personal Finance Assistant",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ---------------------------------------------------------------------------
-# Sidebar — Settings
+# Sidebar — Settings and Model Info
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.title("⚙️ Settings")
-    st.markdown("---")
+    st.markdown("## ⚙️ Assistant Settings")
+    st.divider()
 
-    st.success("Selected backend model: TinyLlama-1.1B-Chat")
+    # --- Model selection ---
+    st.markdown("### 🤖 Backend Model")
 
-    model_mode = st.selectbox(
-        "🤖 Model Mode",
-        options=["Mock Mode", "TinyLlama (Selected Model)"],
+    mode_options = ["Mock Mode", "TinyLlama (Selected Model)"]
+    mode_labels = {
+        "Mock Mode": "📋 Mock Mode",
+        "TinyLlama (Selected Model)": "🦙 TinyLlama (Selected Model)",
+    }
+
+    selected_mode = st.radio(
+        "Choose backend mode",
+        options=mode_options,
+        format_func=lambda x: mode_labels[x],
+        index=0,
         help=(
-            "Mock Mode returns a structured demo response based on your profile. "
-            "TinyLlama mode reflects the selected model from comparative evaluation."
+            "Mock Mode: instant, reliable rule-based responses — best for demos.\n\n"
+            "TinyLlama: live LLM inference using the selected open-source model. "
+            "Requires model to be downloaded. Output quality may vary."
         ),
     )
 
-    language = st.selectbox(
-        "🌐 Language",
-        options=["English", "Bangla"],
-        help="Select the language for the assistant's response.",
+    if selected_mode == "Mock Mode":
+        st.info(
+            "**Mock Mode** generates structured responses using rule-based logic. "
+            "Fast, stable, and reliable for all tasks.",
+            icon="📋",
+        )
+    else:
+        st.info(
+            "**TinyLlama/TinyLlama-1.1B-Chat-v1.0** was selected after comparative evaluation "
+            "against FLAN-T5. It runs locally via Hugging Face Transformers. "
+            "First run requires model download (~2 GB). Output quality may vary "
+            "on CPU-only systems.",
+            icon="🦙",
+        )
+
+    st.divider()
+
+    # --- Language selection ---
+    st.markdown("### 🌐 Output Language")
+
+    language_options = {
+        "English": "English 🇬🇧",
+        "Bangla": "বাংলা 🇧🇩",
+    }
+    selected_language = st.selectbox(
+        "Choose language",
+        options=list(language_options.keys()),
+        format_func=lambda x: language_options[x],
+        index=0,
+        help=(
+            "English: full structured output.\n\n"
+            "Bangla (বাংলা): output is generated with Bangla-oriented text. "
+            "TinyLlama may produce mixed English/Bangla output for small models — "
+            "this is expected behaviour."
+        ),
     )
 
-    task_type = st.selectbox(
-        "📋 Financial Task",
-        options=[
-            "Budget Planning",
-            "Savings Strategy",
-            "Debt Management",
-            "Beginner Investment Guidance",
-        ],
-        help="Choose the type of financial guidance you need.",
+    st.divider()
+
+    # --- Task selection ---
+    st.markdown("### 📋 Financial Task")
+
+    task_options = [
+        "Budget Planning",
+        "Savings Strategy",
+        "Debt Management",
+        "Beginner Investment Guidance",
+    ]
+    selected_task = st.selectbox(
+        "Select task type",
+        options=task_options,
+        index=0,
+        help="Choose the type of financial guidance you need. Each task uses a dedicated prompt strategy.",
     )
 
-    st.markdown("---")
-    st.markdown("#### ℹ️ About")
+    st.divider()
     st.markdown(
-        "**COMP8420 — Assignment 2**  \n"
-        "Smart Personal Finance Assistant  \n"
-        "*Final submission version*"
-    )
-    st.markdown(
-        "This tool collects your financial profile and generates "
-        "personalised recommendations using an LLM backend. "
-        "TinyLlama-1.1B-Chat was selected as the preferred model "
-        "after comparative evaluation."
+        "<small style='color: #888;'>COMP8420 Assignment 2 — LLM Finance Assistant<br>"
+        "Model selected via comparative evaluation notebook.</small>",
+        unsafe_allow_html=True,
     )
 
 # ---------------------------------------------------------------------------
-# Main Header
+# Main header
 # ---------------------------------------------------------------------------
 
-st.title("💰 SmartFinance AI Assistant")
+st.markdown("# 💰 Smart Personal Finance Assistant")
 st.markdown(
-    "Enter your financial details below to receive a tailored recommendation. "
-    "All data is processed locally and is not stored or transmitted anywhere."
+    "Enter your financial profile below to receive personalised advice. "
+    "This assistant uses a selected open-source LLM backend evaluated on "
+    "finance-specific test cases."
 )
-st.markdown("---")
+st.divider()
 
 # ---------------------------------------------------------------------------
-# Input Form
+# Financial profile form
 # ---------------------------------------------------------------------------
 
-with st.form(key="finance_form"):
-    st.subheader("📋 Your Financial Profile")
-    st.caption(
-        "Fill in the fields as accurately as possible. "
-        "The quality of the recommendation depends on the accuracy of your inputs."
-    )
+with st.form("finance_form", clear_on_submit=False):
+    st.markdown("### 👤 Your Financial Profile")
 
-    col1, col2 = st.columns(2, gap="large")
+    col1, col2 = st.columns(2)
 
     with col1:
-        st.markdown("**Personal Details**")
-        age = st.number_input("Age", min_value=16, max_value=100, value=25, step=1)
-        employment_status = st.selectbox(
-            "Employment Status",
-            options=[
-                "Full-time Employed", "Part-time Employed", "Self-employed",
-                "Student", "Unemployed", "Retired",
-            ],
+        age = st.number_input(
+            "Age",
+            min_value=16,
+            max_value=85,
+            value=28,
+            step=1,
+            help="Your current age.",
         )
 
-        st.markdown("**Monthly Finances (AUD)**")
+        employment_status = st.selectbox(
+            "Employment Status",
+            options=["Full-time employed", "Part-time employed", "Self-employed / Freelance",
+                     "Student", "Unemployed", "Retired"],
+            index=0,
+            help="Your current employment situation.",
+        )
+
         monthly_income = st.number_input(
-            "Monthly Income",
-            min_value=0.0, value=4000.0, step=100.0,
-            help="Total take-home income per month after tax.",
+            "Monthly Income (AUD $)",
+            min_value=0,
+            max_value=100_000,
+            value=4_500,
+            step=100,
+            help="Your total monthly take-home income after tax.",
         )
+
         monthly_expenses = st.number_input(
-            "Monthly Expenses",
-            min_value=0.0, value=2500.0, step=100.0,
-            help="Total monthly spending (rent, food, transport, bills, etc.).",
-        )
-        current_savings = st.number_input(
-            "Current Savings",
-            min_value=0.0, value=5000.0, step=500.0,
-            help="Total amount currently in savings or accessible funds.",
+            "Monthly Expenses (AUD $)",
+            min_value=0,
+            max_value=100_000,
+            value=3_200,
+            step=100,
+            help="Your total monthly spending including rent, food, transport, and subscriptions.",
         )
 
     with col2:
-        st.markdown("**Debt & Risk**")
+        current_savings = st.number_input(
+            "Current Savings (AUD $)",
+            min_value=0,
+            max_value=10_000_000,
+            value=8_000,
+            step=500,
+            help="Your total savings across all accounts.",
+        )
+
         current_debt = st.number_input(
-            "Current Debt (AUD)",
-            min_value=0.0, value=0.0, step=500.0,
+            "Current Debt (AUD $)",
+            min_value=0,
+            max_value=10_000_000,
+            value=5_000,
+            step=500,
             help="Total outstanding debt (credit cards, personal loans, student loans, etc.).",
         )
-        risk_tolerance = st.selectbox(
+
+        risk_tolerance = st.select_slider(
             "Risk Tolerance",
             options=["Low", "Medium", "High"],
-            help="Low = prefer safe options. Medium = balanced. High = comfortable with volatility.",
+            value="Medium",
+            help="How comfortable are you with investment risk and short-term losses?",
         )
 
-        st.markdown("**Goals & Preferences**")
-        financial_goal = st.text_input(
-            "Financial Goal",
-            placeholder="e.g., Save for a house deposit, pay off student loans...",
-        )
         investment_horizon = st.selectbox(
             "Investment Horizon",
-            options=["Short (< 2 years)", "Medium (2–5 years)", "Long (5+ years)"],
-            help="How long before you need the money?",
-        )
-        extra_preferences = st.text_area(
-            "Extra Preferences or Constraints",
-            placeholder=(
-                "e.g., No interest-based products, prefer ETFs, "
-                "have 2 dependants, already have a mortgage..."
-            ),
-            height=112,
+            options=[
+                "Short (less than 2 years)",
+                "Medium (2-5 years)",
+                "Long (more than 5 years)",
+            ],
+            index=1,
+            help="How long are you planning to keep funds invested or saved?",
         )
 
-    st.markdown("---")
+    st.markdown("#### 🎯 Goals & Preferences")
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        financial_goal = st.text_input(
+            "Financial Goal",
+            value="Build an emergency fund and start investing",
+            max_chars=150,
+            help="Describe your main financial goal (e.g. 'buy a house in 5 years', 'pay off credit card debt').",
+        )
+
+    with col4:
+        extra_preferences = st.text_input(
+            "Extra Preferences (optional)",
+            value="",
+            max_chars=200,
+            placeholder="e.g. prefer ethical investing, avoid interest-based products, have 2 dependants",
+            help="Any preferences or constraints — ethical investing, family responsibilities, specific products to avoid.",
+        )
+
+    # --- Compute live snapshot preview ---
+    income_val = safe_float(monthly_income)
+    expenses_val = safe_float(monthly_expenses)
+    surplus_val = income_val - expenses_val
+
+    st.markdown("#### 📊 Financial Snapshot Preview")
+    snap_col1, snap_col2, snap_col3, snap_col4 = st.columns(4)
+    snap_col1.metric("Monthly Income", f"${income_val:,.0f}")
+    snap_col2.metric("Monthly Expenses", f"${expenses_val:,.0f}")
+    delta_label = f"${surplus_val:,.0f}/mo"
+    snap_col3.metric(
+        "Monthly Surplus",
+        delta_label,
+        delta=f"${surplus_val:,.0f}" if surplus_val >= 0 else f"-${abs(surplus_val):,.0f}",
+        delta_color="normal" if surplus_val >= 0 else "inverse",
+    )
+    snap_col4.metric("Current Debt", f"${safe_float(current_debt):,.0f}")
+
+    st.markdown("")
     submitted = st.form_submit_button(
-        "🚀 Generate Financial Advice", use_container_width=True
+        "💡 Generate Financial Advice",
+        use_container_width=True,
+        type="primary",
     )
 
 # ---------------------------------------------------------------------------
-# On Submit — Validate, Process, Display
+# Result handling
 # ---------------------------------------------------------------------------
 
 if submitted:
-    raw_profile = {
+    profile = {
         "age": age,
         "employment_status": employment_status,
         "monthly_income": monthly_income,
@@ -171,83 +267,155 @@ if submitted:
         "current_savings": current_savings,
         "current_debt": current_debt,
         "risk_tolerance": risk_tolerance,
-        "financial_goal": financial_goal.strip(),
         "investment_horizon": investment_horizon,
-        "extra_preferences": extra_preferences.strip(),
+        "financial_goal": financial_goal,
+        "extra_preferences": extra_preferences if extra_preferences.strip() else "None stated",
     }
 
-    errors = validate_profile(raw_profile)
-    if errors:
-        for err in errors:
-            st.error(f"⚠️ {err}")
+    # --- Validation ---
+    if monthly_income <= 0:
+        st.error("⚠️ Please enter a valid monthly income greater than zero.")
         st.stop()
 
-    with st.spinner("🤔 Analysing your financial profile…"):
-        result = run_financial_dialogue(
-            profile=raw_profile,
-            task_type=task_type,
-            mode=model_mode,
-            language=language,
+    if monthly_expenses < 0:
+        st.error("⚠️ Monthly expenses cannot be negative.")
+        st.stop()
+
+    if not financial_goal.strip():
+        st.warning("💡 Tip: Adding a specific financial goal gives more personalised advice.")
+
+    # --- Generate response ---
+    with st.spinner(
+        "🤖 TinyLlama is generating your advice… This may take 30–90 seconds on first run."
+        if selected_mode == "TinyLlama (Selected Model)"
+        else "🔄 Generating your personalised financial advice…"
+    ):
+        try:
+            manager = DialogueManager()
+            result = manager.generate_response(
+                profile=profile,
+                task_type=selected_task,
+                mode=selected_mode,
+                language=selected_language,
+            )
+        except Exception as e:
+            st.error(f"❌ An unexpected error occurred: {str(e)}")
+            st.stop()
+
+    # --- Error check from backend ---
+    if not result or isinstance(result, dict) and "error" in result:
+        error_msg = result.get("error", "Unknown error") if isinstance(result, dict) else "No result returned."
+        st.error(f"❌ The assistant encountered an issue: {error_msg}")
+        st.stop()
+
+    # --- Display results ---
+    st.divider()
+    st.markdown("## 📋 Your Personalised Financial Advice")
+
+    lang_note = " (বাংলা)" if selected_language == "Bangla" else ""
+    st.caption(
+        f"Task: **{selected_task}**{lang_note}  ·  "
+        f"Mode: **{selected_mode}**  ·  "
+        f"Language: **{selected_language}**"
+    )
+
+    # --- Recommendation ---
+    recommendation = result.get("recommendation", "")
+    if recommendation:
+        st.markdown("### 💡 Recommendation")
+        st.markdown(recommendation)
+    else:
+        st.warning("No recommendation was returned. Please try again.")
+
+    st.divider()
+
+    # --- Action Steps ---
+    action_steps = result.get("action_steps", [])
+    st.markdown("### ✅ Action Steps")
+
+    if action_steps and isinstance(action_steps, list) and len(action_steps) > 0:
+        useful_steps = [
+            step for step in action_steps
+            if isinstance(step, str) and step.strip() and len(step.strip().split()) >= 3
+        ]
+        if useful_steps:
+            for i, step in enumerate(useful_steps, 1):
+                st.markdown(f"**{i}.** {step.strip()}")
+        else:
+            st.info("Action steps were generated but may need review. Please check the recommendation text above for guidance.")
+    elif isinstance(action_steps, str) and action_steps.strip():
+        for line in action_steps.strip().splitlines():
+            line = line.strip()
+            if line:
+                st.markdown(f"• {line}")
+    else:
+        st.info(
+            "No structured action steps were returned. "
+            "Please refer to the recommendation text for guidance."
         )
 
-    if "error" in result:
-        st.error(f"Something went wrong: {result['error']}")
-        st.stop()
+    st.divider()
 
-    st.success("✅ Your personalised financial advice is ready!")
-    st.markdown("---")
+    # --- Two-column layout for explanation and prompt ---
+    res_col1, res_col2 = st.columns([3, 2])
 
-    st.subheader("👤 Your Financial Snapshot")
-    surplus = compute_surplus(monthly_income, monthly_expenses)
-    savings_rate = compute_savings_rate(monthly_income, monthly_expenses)
+    with res_col1:
+        explanation = result.get("explanation", "")
+        st.markdown("### 📖 Explanation")
+        if explanation and len(explanation.strip().split()) >= 5:
+            st.markdown(explanation)
+        else:
+            st.info("Explanation was not available in this response.")
 
-    col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("Monthly Income", format_currency(monthly_income))
-    col_b.metric("Monthly Expenses", format_currency(monthly_expenses))
-    col_c.metric(
-        "Monthly Surplus",
-        format_currency(surplus),
-        delta=f"{savings_rate:.1f}% savings rate",
-        delta_color="normal" if surplus >= 0 else "inverse",
-    )
-    col_d.metric("Current Savings", format_currency(current_savings))
+    with res_col2:
+        prompt_data = result.get("prompt_used") if isinstance(result, dict) else None
+        with st.expander("🔍 Prompt Preview (Assignment Evidence)", expanded=False):
+            if prompt_data:
+                st.markdown("**Task Type:**")
+                st.code(prompt_data.get("task_type", selected_task), language=None)
 
-    col_e, col_f, col_g, col_h = st.columns(4)
-    col_e.metric("Current Debt", format_currency(current_debt))
-    col_f.metric("Risk Tolerance", risk_tolerance)
-    col_g.metric("Horizon", investment_horizon.split("(")[0].strip())
-    col_h.metric("Task", task_type)
+                st.markdown("**Zero-Shot Prompt:**")
+                st.code(prompt_data.get("zero_shot", "N/A"), language=None)
 
-    st.markdown("---")
+                st.markdown("**Structured Prompt:**")
+                st.code(prompt_data.get("structured", "N/A"), language=None)
 
-    st.subheader(f"💡 {task_type} Recommendation")
-    st.markdown(result.get("recommendation", "_No recommendation available._"))
-    st.markdown("---")
+                if prompt_data.get("few_shot"):
+                    st.markdown("**Few-Shot Prompt:**")
+                    st.code(prompt_data.get("few_shot", "N/A"), language=None)
+            else:
+                task_display = selected_task
+                income_disp = f"${safe_float(monthly_income):,.0f}"
+                expenses_disp = f"${safe_float(monthly_expenses):,.0f}"
+                surplus_disp = f"${surplus_val:,.0f}"
+                st.markdown("**Effective Prompt (reconstructed):**")
+                st.code(
+                    f"Task: {task_display}\n"
+                    f"Profile: age {age}; employment {employment_status}; "
+                    f"income {income_disp}/month; expenses {expenses_disp}/month; "
+                    f"surplus {surplus_disp}/month; risk {risk_tolerance}; "
+                    f"goal: {financial_goal}",
+                    language=None,
+                )
+            st.caption("Prompt preview is included as assignment evidence of LLM prompting strategy.")
 
-    st.subheader("✅ Action Steps")
-    action_steps = result.get("action_steps", [])
-    if isinstance(action_steps, list) and action_steps:
-        for i, step in enumerate(action_steps, start=1):
-            st.markdown(f"**{i}.** {step}")
+    st.divider()
+
+    # --- Disclaimer ---
+    disclaimer = result.get("disclaimer", "")
+    if disclaimer and disclaimer.strip():
+        st.markdown("### ⚠️ Disclaimer")
+        st.warning(disclaimer)
     else:
-        st.markdown(str(action_steps) or "_No action steps provided._")
+        st.warning(
+            "This information is for educational purposes only and is not personalised financial advice. "
+            "Please consult a registered financial adviser before making financial decisions."
+        )
 
-    st.markdown("---")
-
-    st.subheader("🔍 Why This Advice Fits You")
-    st.info(result.get("explanation", "_No explanation available._"))
-
-    with st.expander("🔧 View Generated Prompt (LLM comparison / assignment evidence)"):
-        from prompt_templates import build_structured_prompt
-        preview = build_structured_prompt(raw_profile, task_type, language)
-        st.markdown("**System Prompt:**")
-        st.code(preview.get("system", ""), language="text")
-        st.markdown("**User Prompt:**")
-        st.code(preview.get("user", ""), language="text")
-
-    st.markdown("---")
-    st.warning(result.get(
-        "disclaimer",
-        "⚠️ This is AI-generated advice for educational purposes only. "
-        "Please consult a qualified financial adviser before making any decisions.",
-    ))
+    # --- Assignment footer note ---
+    st.divider()
+    st.caption(
+        "🎓 **COMP8420 Assignment 2** — Smart Personal Finance Assistant  "
+        "| TinyLlama/TinyLlama-1.1B-Chat-v1.0 selected as backend after comparative evaluation  "
+        "| Hugging Face Transformers · Streamlit · Python"
+    )
